@@ -14,7 +14,10 @@ from pydantic import BaseModel, Field
 
 from channels.channel_manager import channel_manager, ChannelInfo
 from formats.converter_factory import ConverterFactory, convert_request, convert_response
-from src.utils.logger import setup_logger
+from src.utils.logger import (
+    setup_logger, log_structured_error,
+    ERROR_TYPE_NETWORK, ERROR_TYPE_AUTH, ERROR_TYPE_RATE_LIMIT, ERROR_TYPE_UPSTREAM_API
+)
 from src.utils.exceptions import ChannelNotFoundError, ConversionError, APIError, TimeoutError
 from src.utils.http_client import get_http_client
 
@@ -140,18 +143,72 @@ async def forward_request(
                 json=converted_data,
                 headers=headers
             )
-            
+
             if response.status_code == 200:
                 return response.json()
+
+            # 根据状态码分类错误类型
+            status = response.status_code
+            if status in (401, 403):
+                error_type = ERROR_TYPE_AUTH
+            elif status == 429:
+                error_type = ERROR_TYPE_RATE_LIMIT
             else:
-                error_detail = f"API request failed with status {response.status_code}: {response.text}"
-                logger.error(error_detail)
-                raise APIError(error_detail)
-                
-    except httpx.TimeoutException:
+                error_type = ERROR_TYPE_UPSTREAM_API
+
+            error_detail = f"API request failed with status {status}: {response.text}"
+            log_structured_error(
+                logger,
+                error_type=error_type,
+                request_method=method,
+                request_url=url,
+                request_headers=headers,
+                request_body=converted_data,
+                response_status=status,
+                response_headers=dict(response.headers),
+                response_body=response.text,
+                extra={
+                    "channel_name": channel.name,
+                    "channel_provider": channel.provider,
+                    "stage": "forward_request",
+                },
+            )
+            raise APIError(error_detail)
+
+    except httpx.TimeoutException as e:
+        log_structured_error(
+            logger,
+            error_type=ERROR_TYPE_NETWORK,
+            exc=e,
+            request_method=method,
+            request_url=url,
+            request_headers=headers,
+            request_body=converted_data,
+            extra={
+                "channel_name": channel.name,
+                "channel_provider": channel.provider,
+                "timeout": channel.timeout,
+                "stage": "forward_request",
+            },
+        )
         raise TimeoutError(f"Request timeout after {channel.timeout} seconds")
+    except APIError:
+        raise
     except Exception as e:
-        logger.error(f"Request failed: {e}")
+        log_structured_error(
+            logger,
+            error_type=ERROR_TYPE_UPSTREAM_API,
+            exc=e,
+            request_method=method,
+            request_url=url,
+            request_headers=headers,
+            request_body=converted_data,
+            extra={
+                "channel_name": channel.name,
+                "channel_provider": channel.provider,
+                "stage": "forward_request",
+            },
+        )
         raise APIError(f"Request failed: {e}")
 
 
@@ -549,7 +606,7 @@ async def test_proxy_connection(request: ProxyTestRequest, _: bool = Depends(get
         
         # 一次性创建HTTP客户端，减少连接开销
         async with httpx.AsyncClient(
-            proxies=proxy_url,
+            proxy=proxy_url,
             timeout=request.timeout,
             follow_redirects=False,
             verify=True,

@@ -5,8 +5,12 @@ Anthropic格式转换器
 from typing import Dict, Any, Optional, List
 import json
 import copy
+import os
 
 from .base_converter import BaseConverter, ConversionResult, ConversionError
+from .unified import UnifiedChatRequest, UnifiedChatResponse, UnifiedContent, UnifiedContentType
+from .unified.stream_state import StreamState, StreamPhase
+from src.utils.logger import log_structured_error, ERROR_TYPE_CONVERSION
 
 # 全局工具状态管理器
 class ToolStateManager:
@@ -138,7 +142,18 @@ class AnthropicConverter(BaseConverter):
                     error=f"Unsupported target format: {target_format}"
                 )
         except Exception as e:
-            self.logger.error(f"Failed to convert Anthropic request to {target_format}: {e}")
+            log_structured_error(
+                self.logger,
+                error_type=ERROR_TYPE_CONVERSION,
+                exc=e,
+                request_body=data,
+                extra={
+                    "converter": self.__class__.__name__,
+                    "source_format": "anthropic",
+                    "target_format": target_format,
+                    "stage": "convert_request",
+                },
+            )
             return ConversionResult(success=False, error=str(e))
     
     def convert_response(
@@ -161,184 +176,131 @@ class AnthropicConverter(BaseConverter):
                     error=f"Unsupported source format: {source_format}"
                 )
         except Exception as e:
-            self.logger.error(f"Failed to convert {source_format} response to Anthropic: {e}")
+            log_structured_error(
+                self.logger,
+                error_type=ERROR_TYPE_CONVERSION,
+                exc=e,
+                response_body=data,
+                extra={
+                    "converter": self.__class__.__name__,
+                    "source_format": source_format,
+                    "target_format": target_format,
+                    "stage": "convert_response",
+                },
+            )
             return ConversionResult(success=False, error=str(e))
     
     def _convert_to_openai_request(self, data: Dict[str, Any]) -> ConversionResult:
-        """转换Anthropic请求到OpenAI格式"""
-        result_data = {}
-        
-        # 处理模型 - 直接使用原始模型名，不进行映射
-        if "model" in data:
-            result_data["model"] = data["model"]
-        
-        # 处理消息和系统消息
-        messages = []
-        
-        # 添加系统消息
-        if "system" in data:
-            messages.append(self._create_system_message(data["system"]))
-        
-        # 转换消息格式
-        if "messages" in data:
-            for msg in data["messages"]:
-                role = msg.get("role")
+        """转换Anthropic请求到OpenAI格式（基于统一类型层）"""
+        # 1) 使用 UnifiedChatRequest 解析 Anthropic 请求
+        unified_request = UnifiedChatRequest.from_anthropic(data)
 
-                # ----------- 普通 user / assistant 文本 --------------
-                if role in ["user", "assistant"]:
-                    # 检查是否包含 tool_result（用户消息中的工具结果）
-                    if role == "user" and isinstance(msg.get("content"), list):
-                        # 检查是否包含 tool_result
-                        has_tool_result = any(
-                            isinstance(item, dict) and item.get("type") == "tool_result"
-                            for item in msg["content"]
+        # 2) 工具定义清理（保持与 OpenAI 的 JSON Schema 兼容）
+        if "tools" in data:
+            cleaned_tools: List[Dict[str, Any]] = []
+            for tool in data.get("tools", []):
+                cleaned_tools.append({
+                    "name": tool.get("name", ""),
+                    "description": tool.get("description", ""),
+                    "input_schema": self._clean_json_schema_properties(tool.get("input_schema", {})),
+                })
+            unified_request.tools = cleaned_tools
+
+        # 3) 思考模式到 OpenAI reasoning 模式的映射
+        if unified_request.thinking_enabled:
+            budget_tokens = unified_request.thinking_budget_tokens
+
+            # 根据 budget_tokens 智能判断 reasoning_effort 等级
+            reasoning_effort = self._determine_reasoning_effort_from_budget(budget_tokens)
+            unified_request.reasoning_effort = reasoning_effort
+
+            # 处理 max_completion_tokens 的优先级逻辑
+            max_completion_tokens: Optional[int] = None
+
+            # 优先级 1：客户端在 Anthropic 请求中传入的 max_tokens
+            if "max_tokens" in data:
+                max_completion_tokens = unified_request.max_tokens
+                unified_request.max_tokens = None  # 避免同时下发 max_tokens 与 max_completion_tokens
+                self.logger.info(
+                    f"Using client max_tokens as max_completion_tokens: {max_completion_tokens}"
+                )
+            else:
+                # 优先级 2：环境变量 OPENAI_REASONING_MAX_TOKENS
+                env_max_tokens = os.environ.get("OPENAI_REASONING_MAX_TOKENS")
+                if env_max_tokens:
+                    try:
+                        max_completion_tokens = int(env_max_tokens)
+                        self.logger.info(
+                            f"Using OPENAI_REASONING_MAX_TOKENS from environment: {max_completion_tokens}"
                         )
-                        
-                        if has_tool_result:
-                            # 处理用户的工具结果消息
-                            for item in msg["content"]:
-                                if isinstance(item, dict) and item.get("type") == "tool_result":
-                                    tool_use_id = item.get("tool_use_id") or item.get("id") or ""
-                                    content_str = str(item.get("content", ""))
-                                    
-                                    messages.append({
-                                        "role": "tool",
-                                        "tool_call_id": tool_use_id,
-                                        "content": content_str,
-                                    })
-                            continue  # 已处理工具结果，跳过后续处理
-                    
-                    # assistant 且包含 tool_use → function_call
-                    if role == "assistant" and isinstance(msg.get("content"), list) and msg["content"]:
-                        first_part = msg["content"][0]
-                        if first_part.get("type") == "tool_use":
-                            func_name = first_part.get("name", "")
-                            func_args = first_part.get("input", {})
-                            messages.append({
-                                "role": "assistant",
-                                "content": None,
-                                "tool_calls": [
-                                    {
-                                        "id": first_part.get("id") or first_part.get("tool_use_id") or f"call_{func_name}_1",
-                                        "type": "function",
-                                        "function": {
-                                            "name": func_name,
-                                            "arguments": json.dumps(func_args, ensure_ascii=False)
-                                        }
-                                    }
-                                ]
-                            })
-                            continue  # 已处理
+                    except ValueError:
+                        self.logger.warning(
+                            f"Invalid OPENAI_REASONING_MAX_TOKENS value '{env_max_tokens}', must be integer"
+                        )
+                        env_max_tokens = None
 
-                    # 普通文本消息
-                    content_converted = self._convert_content_from_anthropic(msg.get("content", ""))
-                    
-                    # 跳过空消息，避免在历史中插入空字符串导致模型误判
-                    if not content_converted:
-                        continue
+                if not env_max_tokens:
+                    # 优先级 3：两者都缺失时抛出错误
+                    raise ConversionError(
+                        "For OpenAI reasoning models, max_completion_tokens is required. "
+                        "Please specify max_tokens in the request or set OPENAI_REASONING_MAX_TOKENS environment variable."
+                    )
 
-                    messages.append({
-                        "role": role,
-                        "content": content_converted
-                    })
+            unified_request.max_completion_tokens = max_completion_tokens
+            self.logger.info(
+                f"Anthropic thinking enabled -> OpenAI reasoning_effort='{reasoning_effort}', "
+                f"max_completion_tokens={max_completion_tokens}"
+            )
+            if budget_tokens:
+                self.logger.info(
+                    f"Budget tokens: {budget_tokens} -> reasoning_effort: '{reasoning_effort}'"
+                )
 
-                # 其它角色忽略
+        # 4) 统一请求对象转换为 OpenAI 请求
+        result_data = unified_request.to_openai()
 
-        result_data["messages"] = messages
+        # 5) tool_choice 兼容性处理
+        if "tool_choice" in data:
+            result_data["tool_choice"] = data["tool_choice"]
+        elif "tools" in data and result_data.get("tools") and "tool_choice" not in result_data:
+            result_data["tool_choice"] = "auto"
 
-        # ---------------- OpenAI 兼容性校验 ----------------
-        # 确保所有 assistant.tool_calls 均有后续 tool 响应消息；否则移除不匹配的 tool_call
-        validated_messages: list = []
-        for idx, m in enumerate(messages):
-            if m.get("role") == "assistant" and m.get("tool_calls"):
-                call_ids = [tc.get("id") for tc in m["tool_calls"] if tc.get("id")]
-                # 统计后续是否有对应的 tool 消息
+        # 6) OpenAI 兼容性校验：确保所有 assistant.tool_calls 均有匹配的 tool 响应
+        messages = result_data.get("messages", [])
+        validated_messages: List[Dict[str, Any]] = []
+        for idx, msg in enumerate(messages):
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                call_ids = [tc.get("id") for tc in msg.get("tool_calls", []) if tc.get("id")]
                 unmatched = set(call_ids)
+
+                # 在后续消息中查找对应的 tool 响应
                 for later in messages[idx + 1:]:
                     if later.get("role") == "tool" and later.get("tool_call_id") in unmatched:
                         unmatched.discard(later["tool_call_id"])
                     if not unmatched:
                         break
+
                 if unmatched:
-                    # 移除无匹配的 tool_call
-                    m["tool_calls"] = [tc for tc in m["tool_calls"] if tc.get("id") not in unmatched]
+                    self.logger.warning(
+                        f"Unmatched tool_call IDs without tool responses, cleaning: {list(unmatched)}"
+                    )
+                    msg["tool_calls"] = [
+                        tc for tc in msg.get("tool_calls", []) if tc.get("id") not in unmatched
+                    ]
                     # 如果全部被移除，则降级为普通 assistant 文本消息
-                    if not m["tool_calls"]:
-                        m.pop("tool_calls", None)
-                        if m.get("content") is None:
-                            m["content"] = ""
-            validated_messages.append(m)
+                    if not msg["tool_calls"]:
+                        msg.pop("tool_calls", None)
+                        if msg.get("content") is None:
+                            msg["content"] = ""
+
+            validated_messages.append(msg)
 
         result_data["messages"] = validated_messages
-        
-        # 处理其他参数
-        if "max_tokens" in data:
-            result_data["max_tokens"] = data["max_tokens"]
-        if "temperature" in data:
-            result_data["temperature"] = data["temperature"]
-        if "top_p" in data:
-            result_data["top_p"] = data["top_p"]
-        if "top_k" in data:
-            # OpenAI不支持top_k，可以记录警告
-            pass
-        if "stop_sequences" in data:
-            result_data["stop"] = data["stop_sequences"]
-        if "stream" in data:
-            result_data["stream"] = data["stream"]
-        
-        # 处理工具调用
-        if "tools" in data:
-            openai_tools = []
-            for tool in data["tools"]:
-                openai_tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": tool.get("name", ""),
-                        "description": tool.get("description", ""),
-                        "parameters": self._clean_json_schema_properties(tool.get("input_schema", {}))
-                    }
-                })
-            result_data["tools"] = openai_tools
-            result_data["tool_choice"] = "auto"
-        
-        # 处理思考预算转换 (Anthropic thinking -> OpenAI reasoning_effort + max_completion_tokens)
-        if "thinking" in data and data["thinking"].get("type") == "enabled":
-            # 检测到思考参数，设置为OpenAI思考模型格式
-            budget_tokens = data["thinking"].get("budget_tokens")
-            
-            # 根据budget_tokens智能判断reasoning_effort等级
-            reasoning_effort = self._determine_reasoning_effort_from_budget(budget_tokens)
-            result_data["reasoning_effort"] = reasoning_effort
-            
-            # 处理max_completion_tokens的优先级逻辑
-            max_completion_tokens = None
-            
-            # 优先级1：客户端传入的max_tokens
-            if "max_tokens" in data:
-                max_completion_tokens = data["max_tokens"]
-                result_data.pop("max_tokens", None)  # 移除max_tokens，使用max_completion_tokens
-                self.logger.info(f"Using client max_tokens as max_completion_tokens: {max_completion_tokens}")
-            else:
-                # 优先级2：环境变量OPENAI_REASONING_MAX_TOKENS
-                import os
-                env_max_tokens = os.environ.get("OPENAI_REASONING_MAX_TOKENS")
-                if env_max_tokens:
-                    try:
-                        max_completion_tokens = int(env_max_tokens)
-                        self.logger.info(f"Using OPENAI_REASONING_MAX_TOKENS from environment: {max_completion_tokens}")
-                    except ValueError:
-                        self.logger.warning(f"Invalid OPENAI_REASONING_MAX_TOKENS value '{env_max_tokens}', must be integer")
-                        env_max_tokens = None
-                
-                if not env_max_tokens:
-                    # 优先级3：都没有则报错
-                    raise ConversionError("For OpenAI reasoning models, max_completion_tokens is required. Please specify max_tokens in the request or set OPENAI_REASONING_MAX_TOKENS environment variable.")
-            
-            result_data["max_completion_tokens"] = max_completion_tokens
-            self.logger.info(f"Anthropic thinking enabled -> OpenAI reasoning_effort='{reasoning_effort}', max_completion_tokens={max_completion_tokens}")
-            if budget_tokens:
-                self.logger.info(f"Budget tokens: {budget_tokens} -> reasoning_effort: '{reasoning_effort}'")
-        
+
+        # 7) 与旧实现保持一致：如果原请求未提供 model 字段，则不在输出中强行添加
+        if "model" not in data:
+            result_data.pop("model", None)
+
         return ConversionResult(success=True, data=result_data)
     
     def _convert_to_gemini_request(self, data: Dict[str, Any]) -> ConversionResult:
@@ -454,80 +416,90 @@ class AnthropicConverter(BaseConverter):
         return ConversionResult(success=True, data=cleaned_result_data)
     
     def _convert_from_openai_response(self, data: Dict[str, Any]) -> ConversionResult:
-        """转换OpenAI响应到Anthropic格式"""
-        # 必须有原始模型名称，否则报错
+        """转换OpenAI响应到Anthropic格式（基于统一中间层）"""
+        # 必须有原始模型名称
         if not self.original_model:
             raise ValueError("Original model name is required for response conversion")
-            
-        result_data = {
-            "id": data.get("id", "msg_openai"),
-            "type": "message",
-            "role": "assistant",
-            "content": [],
-            "model": self.original_model,  # 使用原始模型名称
-            "stop_reason": "end_turn",
-            "usage": {}
-        }
-        
-        # 处理选择
-        if "choices" in data and data["choices"] and data["choices"][0]:
-            choice = data["choices"][0]
-            message = choice.get("message", {})
-            # --------------- 处理内容与工具调用 ---------------
-            content_list = []
 
-            # 1) 处理 tool_calls → tool_use
-            if message.get("tool_calls"):
-                for tc in message["tool_calls"]:
-                    if tc and "function" in tc:
-                        func = tc["function"]
-                    else:
-                        continue
-                    # OpenAI 规范中 arguments 可能是 JSON 字符串
-                    arg_str = func.get("arguments", "{}")
-                    try:
-                        arg_obj = json.loads(arg_str) if isinstance(arg_str, str) else arg_str
-                    except Exception:
-                        arg_obj = {}
+        # 1) 通过统一中间层解析 OpenAI 响应
+        unified_response = UnifiedChatResponse.from_openai(data, self.original_model)
 
-                    content_list.append({
-                        "type": "tool_use",
-                        "id": tc.get("id", ""),
-                        "name": func.get("name", ""),
-                        "input": arg_obj,
-                    })
-
-            # 2) 普通文本内容，检查是否包含thinking标签
-            content_text = message.get("content", "")
-            if content_text:
-                # 检查并提取thinking内容
-                extracted_content = self._extract_thinking_from_openai_text(content_text)
-                if isinstance(extracted_content, list):
-                    # 有多个内容块（包含thinking）
-                    content_list.extend(extracted_content)
+        # 2) 兼容旧实现：从文本内容中解析 <thinking> 标签
+        normalized_content: List[UnifiedContent] = []
+        for c in unified_response.content:
+            if c.type == UnifiedContentType.TEXT and isinstance(c.text, str):
+                extracted = self._extract_thinking_from_openai_text(c.text)
+                if isinstance(extracted, list):
+                    for block in extracted:
+                        block_type = block.get("type")
+                        if block_type == "thinking":
+                            normalized_content.append(
+                                UnifiedContent(
+                                    type=UnifiedContentType.THINKING,
+                                    text=block.get("thinking", ""),
+                                )
+                            )
+                        else:
+                            normalized_content.append(
+                                UnifiedContent(
+                                    type=UnifiedContentType.TEXT,
+                                    text=block.get("text", ""),
+                                )
+                            )
                 else:
-                    # 普通文本
-                    content_list.append({
-                        "type": "text",
-                        "text": extracted_content,
-                    })
+                    c.text = extracted
+                    normalized_content.append(c)
+            else:
+                normalized_content.append(c)
+        unified_response.content = normalized_content
 
-            if content_list:
-                result_data["content"] = content_list
+        # 3) 支持 annotations 透传
+        annotations = self._extract_annotations_from_openai(data)
+        if annotations:
+            for c in unified_response.content:
+                if c.type == UnifiedContentType.TEXT:
+                    c.annotations = annotations
 
-            # 映射结束原因（包含 tool_calls → tool_use）
-            finish_reason = choice.get("finish_reason", "stop")
-            result_data["stop_reason"] = self._map_finish_reason(finish_reason, "openai", "anthropic")
-        
-        # 处理使用情况
-        if "usage" in data and data["usage"] is not None:
-            usage = data["usage"]
-            result_data["usage"] = {
-                "input_tokens": usage.get("prompt_tokens", 0),
-                "output_tokens": usage.get("completion_tokens", 0)
-            }
-        
+        # 4) 转换为 Anthropic 格式
+        result_data = unified_response.to_anthropic()
+
+        # 5) 保持向后兼容：id / stop_reason / usage
+        result_data["id"] = data.get("id") or result_data.get("id") or "msg_openai"
+
+        finish_reason = "stop"
+        if data.get("choices") and data["choices"][0]:
+            finish_reason = data["choices"][0].get("finish_reason", "stop")
+        result_data["stop_reason"] = self._map_finish_reason(finish_reason, "openai", "anthropic")
+
+        if "usage" not in result_data or not result_data["usage"]:
+            if data.get("usage"):
+                usage = data["usage"]
+                result_data["usage"] = {
+                    "input_tokens": usage.get("prompt_tokens", 0),
+                    "output_tokens": usage.get("completion_tokens", 0),
+                }
+            else:
+                result_data["usage"] = {}
+
         return ConversionResult(success=True, data=result_data)
+
+    def _extract_annotations_from_openai(self, data: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+        """从 OpenAI 响应中提取 annotations 数组"""
+        try:
+            choices = data.get("choices") or []
+            if not choices:
+                return data.get("annotations")
+            first_choice = choices[0]
+            if not isinstance(first_choice, dict):
+                return None
+            message = first_choice.get("message", {})
+            return (
+                message.get("annotations")
+                or first_choice.get("annotations")
+                or data.get("annotations")
+            )
+        except Exception:
+            return None
     
     def _extract_thinking_from_openai_text(self, text: str) -> Any:
         """从OpenAI文本中提取thinking内容，返回Anthropic格式的content blocks"""
@@ -635,235 +607,206 @@ class AnthropicConverter(BaseConverter):
         return ConversionResult(success=True, data=result_data)
     
     def _convert_from_openai_streaming_chunk(self, data: Dict[str, Any]) -> ConversionResult:
-        """转换OpenAI流式响应chunk到Anthropic SSE格式 """
-        import json, time, random
-        
-        # 首先验证原始模型名称，确保在状态初始化之前就检查
+        """转换OpenAI流式响应chunk到Anthropic SSE格式（基于StreamState）"""
+        import json
+        import time
+
+        # 1) 校验原始模型名
         if not self.original_model:
             raise ValueError("Original model name is required for streaming response conversion")
-        
-        # 初始化流状态 
-        if not hasattr(self, '_streaming_state') or getattr(self, '_force_reset', False):
-            # 清理可能残留的状态，避免状态污染
-            for attr in ['_gemini_sent_start', '_gemini_stream_id', '_gemini_text_started', '_force_reset']:
+
+        # 2) 初始化 StreamState
+        if not hasattr(self, "_openai_stream_state") or getattr(self, "_force_reset", False):
+            for attr in ["_gemini_sent_start", "_gemini_stream_id", "_gemini_text_started", "_force_reset"]:
                 if hasattr(self, attr):
                     delattr(self, attr)
-            
-            self._streaming_state = {
-                'message_id': f"msg_{int(time.time() * 1000)}",
-                'model': self.original_model,  # 确保使用有效的模型名称
-                'has_started': False,
-                'has_text_content_started': False,
-                'has_finished': False,
-                'content_index': 0,
-                'text_content_index': None,  # 记录文本块的索引
-                'tool_calls': {},  # Map[tool_call_index, ToolCallInfo]
-                'tool_call_index_to_content_block_index': {},  # OpenAI index -> Anthropic index
-                'is_closed': False
-            }
-        
-        # 解析OpenAI chunk数据
-        choice = None
-        if "choices" in data and data["choices"] and data["choices"][0]:
-            choice = data["choices"][0]
-        
+            self._openai_stream_state = StreamState(
+                model=self.original_model,
+                original_model=self.original_model,
+            )
+
+        state: StreamState = self._openai_stream_state
+
+        # 3) 解析 OpenAI chunk
+        choices = data.get("choices") or []
+        choice = choices[0] if choices else None
         if not choice:
             return ConversionResult(success=True, data="")
-        
-        delta = choice.get("delta", {})
-        content = delta.get("content", "")
-        tool_calls = delta.get("tool_calls", [])
+
+        delta = choice.get("delta", {}) or {}
+        content = delta.get("content") or ""
+        tool_calls = delta.get("tool_calls") or []
+        reasoning_content = delta.get("reasoning_content") or ""
         finish_reason = choice.get("finish_reason")
-        
-        events = []
-        state = self._streaming_state
-        
-        # 1. 发送message_start (仅一次，在第一次收到chunk时)
-        # 修复：应该在收到任何角色信息或有意义的delta时就发送，而不只是等待content或tool_calls
-        if not state['has_started'] and not state['is_closed']:
-            # 检查是否是有意义的chunk（有role、content或tool_calls）
+
+        events: List[str] = []
+
+        # 4) 发送 message_start（仅一次）
+        if not state.sent_message_start and not state.sent_message_stop:
             has_meaningful_data = (
-                delta.get("role") or 
-                content or 
-                tool_calls or 
-                # 或者choice中有任何有意义的信息
-                choice.get("index") is not None
+                delta.get("role")
+                or content
+                or reasoning_content
+                or tool_calls
+                or choice.get("index") is not None
             )
-            
             if has_meaningful_data:
-                state['has_started'] = True
-                # 确保使用有效的模型名称和role - 添加防御性检查
-                model_name = state.get('model') or self.original_model or 'unknown'
+                state.sent_message_start = True
+                state.phase = StreamPhase.MESSAGE_STARTED
+                model_name = state.model or self.original_model or "unknown"
                 message_start = {
                     "type": "message_start",
                     "message": {
-                        "id": state['message_id'],
+                        "id": state.stream_id,
                         "type": "message",
-                        "role": "assistant",  # 始终确保role属性存在
+                        "role": "assistant",
                         "content": [],
-                        "model": model_name,  # 使用防御性检查后的模型名称
+                        "model": model_name,
                         "stop_reason": None,
                         "stop_sequence": None,
-                        "usage": {"input_tokens": 0, "output_tokens": 0}
-                    }
+                        "usage": {"input_tokens": 0, "output_tokens": 0},
+                    },
                 }
                 events.append(f"event: message_start\ndata: {json.dumps(message_start, ensure_ascii=False)}\n\n")
-        
-        # 2. 处理文本内容
-        if content and not state['is_closed']:
-            # 开始文本content block
-            if not state['has_text_content_started']:
-                state['has_text_content_started'] = True
-                state['text_content_index'] = state['content_index']  # 记住文本块的索引
+
+        # 5) 处理 reasoning_content → thinking 块（OpenAI o1/o3）
+        if reasoning_content and not state.sent_message_stop:
+            is_new_thinking = not state.thinking_block_started
+            thinking_index = state.start_thinking_block()
+
+            if is_new_thinking:
                 content_block_start = {
                     "type": "content_block_start",
-                    "index": state['text_content_index'],
-                    "content_block": {"type": "text", "text": ""}
+                    "index": thinking_index,
+                    "content_block": {"type": "thinking", "thinking": ""},
                 }
                 events.append(f"event: content_block_start\ndata: {json.dumps(content_block_start, ensure_ascii=False)}\n\n")
-                state['content_index'] += 1  # 为后续块递增索引
-            
-            # 发送文本增量
+
+            state.thinking_buffer += reasoning_content
+            thinking_delta = {
+                "type": "content_block_delta",
+                "index": thinking_index,
+                "delta": {"type": "thinking_delta", "thinking": reasoning_content},
+            }
+            events.append(f"event: content_block_delta\ndata: {json.dumps(thinking_delta, ensure_ascii=False)}\n\n")
+
+            if state.phase in (StreamPhase.NOT_STARTED, StreamPhase.MESSAGE_STARTED):
+                state.phase = StreamPhase.CONTENT_STREAMING
+
+        # 6) 处理普通文本 content
+        if content and not state.sent_message_stop:
+            is_new_text = not state.text_block_started
+            text_index = state.start_text_block()
+
+            if is_new_text:
+                content_block_start = {
+                    "type": "content_block_start",
+                    "index": text_index,
+                    "content_block": {"type": "text", "text": ""},
+                }
+                events.append(f"event: content_block_start\ndata: {json.dumps(content_block_start, ensure_ascii=False)}\n\n")
+
             content_delta = {
                 "type": "content_block_delta",
-                "index": state['text_content_index'],
-                "delta": {
-                    "type": "text_delta",
-                    "text": content
-                }
+                "index": text_index,
+                "delta": {"type": "text_delta", "text": content},
             }
             events.append(f"event: content_block_delta\ndata: {json.dumps(content_delta, ensure_ascii=False)}\n\n")
-        
-        # 3. 处理工具调用 - 关键部分
-        if tool_calls and not state['is_closed']:
-            processed_in_this_chunk = set()
-            
+
+            if state.phase in (StreamPhase.NOT_STARTED, StreamPhase.MESSAGE_STARTED):
+                state.phase = StreamPhase.CONTENT_STREAMING
+
+        # 7) 处理工具调用 tool_calls → tool_use
+        if tool_calls and not state.sent_message_stop:
+            state.phase = StreamPhase.TOOL_STREAMING
+            processed_in_this_chunk: set = set()
+
             for tool_call in tool_calls:
                 if not tool_call:
                     continue
-                
-                tool_call_index = tool_call.get('index', 0)
+
+                tool_call_index = tool_call.get("index", 0)
                 if tool_call_index in processed_in_this_chunk:
                     continue
                 processed_in_this_chunk.add(tool_call_index)
-                
-                # 检查是否是新的tool_call_index
-                is_unknown_index = tool_call_index not in state['tool_call_index_to_content_block_index']
-                
-                if is_unknown_index:
-                    # 为新的工具调用分配content_block索引
-                    tool_content_block_index = state['content_index']
-                    state['tool_call_index_to_content_block_index'][tool_call_index] = tool_content_block_index
-                    
-                    # 生成工具调用ID和名称
-                    tool_call_id = tool_call.get('id', f"call_{int(time.time())}_{tool_call_index}")
-                    tool_call_name = tool_call.get('function', {}).get('name', f"tool_{tool_call_index}")
-                    
-                    # 开始新的tool_use content block
+
+                func = tool_call.get("function", {}) or {}
+                tool_state = state.get_tool_call(tool_call_index)
+
+                if not tool_state:
+                    tool_call_id = tool_call.get("id", f"call_{int(time.time())}_{tool_call_index}")
+                    tool_call_name = func.get("name", f"tool_{tool_call_index}")
+                    tool_content_index = state.start_tool_call(tool_call_index, tool_call_id, tool_call_name)
+
                     content_block_start = {
                         "type": "content_block_start",
-                        "index": tool_content_block_index,
+                        "index": tool_content_index,
                         "content_block": {
                             "type": "tool_use",
                             "id": tool_call_id,
                             "name": tool_call_name,
-                            "input": {}
-                        }
+                            "input": {},
+                        },
                     }
                     events.append(f"event: content_block_start\ndata: {json.dumps(content_block_start, ensure_ascii=False)}\n\n")
-                    
-                    # 存储工具调用信息
-                    state['tool_calls'][tool_call_index] = {
-                        'id': tool_call_id,
-                        'name': tool_call_name,
-                        'arguments': '',
-                        'content_block_index': tool_content_block_index
-                    }
-                    
-                    state['content_index'] += 1  # 为下一个块递增索引
-                
-                # 处理函数参数累积
-                if tool_call.get('function', {}).get('arguments'):
-                    current_tool_call = state['tool_calls'].get(tool_call_index)
-                    if current_tool_call:
-                        # 累积参数片段
-                        arguments_fragment = tool_call['function']['arguments']
-                        current_tool_call['arguments'] += arguments_fragment
-                        
-                        # 清理并验证JSON片段
-                        cleaned_fragment = self._clean_json_fragment(arguments_fragment)
-                        
-                        if cleaned_fragment:  # 只发送非空的清理后片段
-                            # 发送参数增量（使用正确的content_block索引）
-                            input_json_delta = {
-                                "type": "content_block_delta",
-                                "index": current_tool_call['content_block_index'],
-                                "delta": {
-                                    "type": "input_json_delta",
-                                    "partial_json": cleaned_fragment
-                                }
-                            }
-                            events.append(f"event: content_block_delta\ndata: {json.dumps(input_json_delta, ensure_ascii=False)}\n\n")
-        
-        # 4. 处理流结束 - 只有在message已经开始的情况下才处理
-        if finish_reason and not state['has_finished'] and state['has_started']:
-            state['has_finished'] = True
-            
-            # 停止所有活跃的content blocks
-            # 先停止所有工具调用块
-            for tool_call_info in state['tool_calls'].values():
-                content_block_stop = {"type": "content_block_stop", "index": tool_call_info['content_block_index']}
+                else:
+                    tool_content_index = tool_state.content_block_index
+
+                arguments_fragment = func.get("arguments")
+                if arguments_fragment:
+                    state.append_tool_arguments(tool_call_index, arguments_fragment)
+                    cleaned_fragment = self._clean_json_fragment(arguments_fragment)
+
+                    if cleaned_fragment:
+                        input_json_delta = {
+                            "type": "content_block_delta",
+                            "index": tool_content_index,
+                            "delta": {"type": "input_json_delta", "partial_json": cleaned_fragment},
+                        }
+                        events.append(f"event: content_block_delta\ndata: {json.dumps(input_json_delta, ensure_ascii=False)}\n\n")
+
+        # 8) 处理流结束
+        if finish_reason and not state.sent_message_stop and state.sent_message_start:
+            state.phase = StreamPhase.FINISHED
+
+            # 按顺序关闭所有已开启的 content blocks
+            for index in state.get_all_content_block_indices():
+                content_block_stop = {"type": "content_block_stop", "index": index}
                 events.append(f"event: content_block_stop\ndata: {json.dumps(content_block_stop, ensure_ascii=False)}\n\n")
-            
-            # 停止文本块（如果有）
-            if state['has_text_content_started'] and not state['is_closed']:
-                content_block_stop = {"type": "content_block_stop", "index": state['text_content_index']}
-                events.append(f"event: content_block_stop\ndata: {json.dumps(content_block_stop, ensure_ascii=False)}\n\n")
-            
-            # 映射finish_reason - 使用统一的映射方法
+
             anthropic_stop_reason = self._map_finish_reason(finish_reason, "openai", "anthropic")
-            
-            # 发送message_delta
-            message_delta = {
+
+            message_delta: Dict[str, Any] = {
                 "type": "message_delta",
-                "delta": {
-                    "stop_reason": anthropic_stop_reason,
-                    "stop_sequence": None
-                }
+                "delta": {"stop_reason": anthropic_stop_reason, "stop_sequence": None},
             }
-            
-            # 总是提供 usage 信息，即使 OpenAI 返回 null
-            if "usage" in data and data["usage"] is not None:
+
+            if data.get("usage") is not None:
                 usage = data["usage"]
-                message_delta["usage"] = {
-                    "input_tokens": usage.get("prompt_tokens", 0),
-                    "output_tokens": usage.get("completion_tokens", 0)
-                }
-            else:
-                # 如果没有 usage 信息，提供默认值以避免前端错误
-                message_delta["usage"] = {
-                    "input_tokens": 0,
-                    "output_tokens": 0
-                }
-            
+                state.accumulate_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+            message_delta["usage"] = {
+                "input_tokens": state.input_tokens or 0,
+                "output_tokens": state.output_tokens or 0,
+            }
+
             events.append(f"event: message_delta\ndata: {json.dumps(message_delta, ensure_ascii=False)}\n\n")
-            
-            # 发送message_stop
-            message_stop = {"type": "message_stop"}
-            events.append(f"event: message_stop\ndata: {json.dumps(message_stop, ensure_ascii=False)}\n\n")
-        
-        # 清理状态（如果流结束了）
-        if finish_reason:
-            state['is_closed'] = True
-            if hasattr(self, '_streaming_state'):
-                delattr(self, '_streaming_state')
-        
-        # 返回结果 - 改进事件处理逻辑
+            events.append(f"event: message_stop\ndata: {{\"type\": \"message_stop\"}}\n\n")
+
+            state.sent_message_stop = True
+
+        # 9) 流结束后清理状态
+        if finish_reason and hasattr(self, "_openai_stream_state"):
+            delattr(self, "_openai_stream_state")
+
+        # 10) 返回 SSE 串
         if not events:
-            # 即使没有事件，也要记录这种情况以便调试
-            self.logger.debug(f"No events generated for chunk - content: {bool(content)}, tool_calls: {bool(tool_calls)}, has_started: {state.get('has_started', False)}")
+            self.logger.debug(
+                f"No events generated for chunk - content: {bool(content)}, "
+                f"reasoning: {bool(reasoning_content)}, tool_calls: {bool(tool_calls)}, "
+                f"sent_message_start: {state.sent_message_start}"
+            )
             return ConversionResult(success=True, data="")
-        
+
         result_data = "".join(events)
         self.logger.debug(f"Generated {len(events)} events, total data length: {len(result_data)}")
         return ConversionResult(success=True, data=result_data)

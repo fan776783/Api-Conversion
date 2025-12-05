@@ -133,20 +133,22 @@ async def get_http_client(channel_info: ChannelInfo, timeout: float = 30.0):
     else:
         logger.debug(f"Channel {channel_info.name}: Creating HTTP client without proxy")
     
-    async with httpx.AsyncClient(timeout=timeout, proxies=proxy_config) as client:
+    proxy = next(iter(proxy_config.values())) if proxy_config else None
+    async with httpx.AsyncClient(timeout=timeout, proxy=proxy) as client:
         yield client
 
 
-@asynccontextmanager  
+@asynccontextmanager
 async def get_http_client_from_config(channel_config: ChannelConfig, timeout: float = 30.0):
     """从渠道配置获取配置了代理的HTTP客户端"""
     proxy_config = create_proxy_config_from_channel_config(channel_config)
-    
+
     if proxy_config:
         logger.info(f"Config for {channel_config.provider}: Creating HTTP client with proxy")
         logger.debug(f"Config for {channel_config.provider}: Proxy config keys: {list(proxy_config.keys())}")
     else:
         logger.debug(f"Config for {channel_config.provider}: Creating HTTP client without proxy")
-    
-    async with httpx.AsyncClient(timeout=timeout, proxies=proxy_config) as client:
+
+    proxy = next(iter(proxy_config.values())) if proxy_config else None
+    async with httpx.AsyncClient(timeout=timeout, proxy=proxy) as client:
         yield client

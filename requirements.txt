@@ -1,19 +1,31 @@
-fastapi==0.104.1
-uvicorn==0.24.0
-pydantic==2.5.0
-httpx[socks]==0.25.2
-pyyaml==6.0.1
-python-dotenv==1.0.0
-typer==0.12.3
-rich==13.7.0
-pytest==7.4.3
-pytest-asyncio==0.21.1
-pytest-cov==4.1.0
-black==23.11.0
-isort==5.12.0
-flake8==6.1.0
-mypy==1.7.1
-python-multipart==0.0.6
-cryptography==41.0.7
-itsdangerous==2.1.2
-pymysql==1.1.0
+# 核心框架 - 升级到支持 Python 3.14 的版本
+fastapi>=0.115.0
+uvicorn>=0.32.0
+pydantic>=2.10.0  # 支持 Python 3.14
+httpx[socks]>=0.27.0
+pyyaml>=6.0.1
+python-dotenv>=1.0.0
+
+# CLI 工具
+typer>=0.15.0
+rich>=13.9.0
+
+# 测试工具
+pytest>=8.3.0
+pytest-asyncio>=0.24.0
+pytest-cov>=6.0.0
+
+# 代码质量工具
+black>=24.10.0
+isort>=5.13.0
+flake8>=7.1.0
+mypy>=1.13.0
+
+# Token 计算
+tiktoken>=0.7.0
+
+# 其他依赖
+python-multipart>=0.0.20
+cryptography>=44.0.0
+itsdangerous>=2.2.0
+pymysql>=1.1.1

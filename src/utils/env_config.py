@@ -90,9 +90,12 @@ class EnvConfig:
     def anthropic_max_tokens(self) -> int:
         """Anthropic最大token数"""
         return self.get_int("ANTHROPIC_MAX_TOKENS", 4096)
-    
 
-    
+    @property
+    def max_tokens_limit(self) -> int:
+        """max_tokens 上限（0 表示不限制）"""
+        return self.get_int("MAX_TOKENS_LIMIT", 0)
+
     # ================================
     # 数据库配置
     # ================================

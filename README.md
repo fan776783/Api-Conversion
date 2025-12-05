@@ -107,7 +107,7 @@ OpenAI ↔ Anthropic ↔ Gemini
 1. **安装依赖**
 
 ```bash
-pip install -r requirements.txt
+pip3 install -r requirements.txt
 ```
 
 2. **启动 Web 服务**

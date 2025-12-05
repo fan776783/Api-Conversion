@@ -15,13 +15,76 @@ from channels.channel_manager import channel_manager, ChannelInfo
 from formats.converter_factory import ConverterFactory, convert_request, convert_response, convert_streaming_chunk
 from formats.base_converter import ConversionResult
 from utils.security import mask_api_key, safe_log_request, safe_log_response
-from src.utils.logger import setup_logger
+from src.utils.logger import (
+    setup_logger, log_structured_error, log_request_entry,
+    ERROR_TYPE_NETWORK, ERROR_TYPE_AUTH, ERROR_TYPE_RATE_LIMIT,
+    ERROR_TYPE_CONVERSION, ERROR_TYPE_UPSTREAM_API
+)
 from src.utils.exceptions import ChannelNotFoundError, ConversionError, APIError, TimeoutError
 from src.utils.http_client import get_http_client
+from src.utils.env_config import env_config
 
 logger = setup_logger("unified_api")
 
 router = APIRouter()
+
+
+def _extract_max_tokens(source_format: str, request_data: Dict[str, Any]) -> Optional[int]:
+    """从请求中提取 max_tokens 值"""
+    if not isinstance(request_data, dict):
+        return None
+    # OpenAI / Anthropic: max_tokens
+    if "max_tokens" in request_data:
+        try:
+            return int(request_data["max_tokens"])
+        except (TypeError, ValueError):
+            return None
+    # Gemini: generationConfig.maxOutputTokens
+    if source_format == "gemini":
+        config = request_data.get("generationConfig")
+        if isinstance(config, dict) and "maxOutputTokens" in config:
+            try:
+                return int(config["maxOutputTokens"])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _parse_upstream_error(provider: str, status_code: int, body: str) -> str:
+    """解析上游错误，返回友好的错误信息"""
+    try:
+        data = json.loads(body) if body else {}
+    except Exception:
+        data = {}
+
+    # 尝试从常见结构中提取错误信息
+    error_msg = None
+    if isinstance(data, dict):
+        error_obj = data.get("error")
+        if isinstance(error_obj, dict):
+            error_msg = error_obj.get("message") or error_obj.get("description")
+            error_type = error_obj.get("type")
+            code = error_obj.get("code")
+            if error_msg and (error_type or code):
+                meta = []
+                if error_type:
+                    meta.append(f"type={error_type}")
+                if code:
+                    meta.append(f"code={code}")
+                error_msg = f"{error_msg} ({', '.join(meta)})"
+        elif isinstance(error_obj, str):
+            error_msg = error_obj
+        if not error_msg:
+            error_msg = data.get("message") or data.get("detail")
+
+    prefix = f"{provider} API error ({status_code})"
+    if error_msg:
+        return f"{prefix}: {error_msg}"
+
+    # 截断过长的原始响应
+    if body and len(body) > 300:
+        body = body[:300] + "..."
+    return f"{prefix}: {body}" if body else prefix
 
 
 async def fetch_models_from_channel_for_format(channel: ChannelInfo, target_format: str) -> List[Dict[str, Any]]:
@@ -409,6 +472,7 @@ async def forward_request_to_channel(
         logger.warning(f"Failed to apply model mapping: {e}")
 
     # 2. 统一构建目标API的URL和headers（支持所有功能组合）
+    url = None  # 防御性初始化
     target_headers = {"Content-Type": "application/json"}
     # Always use original request_data for stream detection, since conversion_result.data
     # may have stream field removed (especially for Gemini passthrough)
@@ -462,13 +526,44 @@ async def forward_request_to_channel(
                         ) as response:
                             async for chunk in handle_streaming_response(response, channel, request_data, source_format):
                                 yield chunk
-                except httpx.TimeoutException:
-                    logger.error(f"Streaming request timeout after {channel.timeout} seconds")
+                except httpx.TimeoutException as e:
+                    log_structured_error(
+                        logger,
+                        error_type=ERROR_TYPE_NETWORK,
+                        exc=e,
+                        request_method="POST",
+                        request_url=url,
+                        request_headers=headers,
+                        request_body=conversion_result.data,
+                        extra={
+                            "channel_name": channel.name,
+                            "channel_provider": channel.provider,
+                            "is_streaming": True,
+                            "stage": "stream_generator",
+                            "timeout": channel.timeout,
+                        },
+                    )
                     raise TimeoutError(f"Streaming request timeout after {channel.timeout} seconds")
+                except HTTPException:
+                    # 透传 HTTPException，保持原有状态码
+                    raise
                 except Exception as e:
                     error_msg = f"Streaming request failed: {str(e) if e else 'Unknown error'}"
-                    logger.error(error_msg)
-                    logger.exception("Streaming request exception details:")
+                    log_structured_error(
+                        logger,
+                        error_type=ERROR_TYPE_UPSTREAM_API,
+                        exc=e,
+                        request_method="POST",
+                        request_url=url,
+                        request_headers=headers,
+                        request_body=conversion_result.data,
+                        extra={
+                            "channel_name": channel.name,
+                            "channel_provider": channel.provider,
+                            "is_streaming": True,
+                            "stage": "stream_generator",
+                        },
+                    )
                     raise APIError(error_msg)
             
             return stream_generator()
@@ -484,11 +579,43 @@ async def forward_request_to_channel(
                 result = handle_non_streaming_response(response, channel, request_data, source_format)
                 return result
                     
-    except httpx.TimeoutException:
-        logger.error(f"Non-streaming request timeout after {channel.timeout} seconds")
+    except httpx.TimeoutException as e:
+        log_structured_error(
+            logger,
+            error_type=ERROR_TYPE_NETWORK,
+            exc=e,
+            request_method="POST",
+            request_url=url,
+            request_headers=headers,
+            request_body=conversion_result.data,
+            extra={
+                "channel_name": channel.name,
+                "channel_provider": channel.provider,
+                "is_streaming": False,
+                "stage": "forward_request_to_channel",
+                "timeout": channel.timeout,
+            },
+        )
         raise TimeoutError(f"Non-streaming request timeout after {channel.timeout} seconds")
+    except HTTPException:
+        # 透传 HTTPException，保持原有状态码
+        raise
     except Exception as e:
-        logger.error(f"Non-streaming request failed: {e}")
+        log_structured_error(
+            logger,
+            error_type=ERROR_TYPE_UPSTREAM_API,
+            exc=e,
+            request_method="POST",
+            request_url=url,
+            request_headers=headers,
+            request_body=conversion_result.data,
+            extra={
+                "channel_name": channel.name,
+                "channel_provider": channel.provider,
+                "is_streaming": False,
+                "stage": "forward_request_to_channel",
+            },
+        )
         raise APIError(f"Non-streaming request failed: {e}")
 
 
@@ -714,14 +841,23 @@ async def handle_streaming_response(response, channel, request_data, source_form
                     break
                     
             except json.JSONDecodeError as e:
-                # 详细记录JSON解析错误信息用于调试
-                logger.error(f"JSON decode error in streaming response:")
-                logger.error(f"  - Error: {e}")
-                logger.error(f"  - Data content: '{data_content}'")
-                logger.error(f"  - Data length: {len(data_content)}")
-                logger.error(f"  - Channel provider: {channel.provider}")
-                logger.error(f"  - Source format: {source_format}")
-                logger.error(f"  - Chunk count: {chunk_count}")
+                # 使用结构化日志记录流式 JSON 解析错误
+                log_structured_error(
+                    logger,
+                    error_type=ERROR_TYPE_UPSTREAM_API,
+                    exc=e,
+                    request_body=request_data,
+                    response_status=response.status_code,
+                    response_body=data_content,
+                    extra={
+                        "channel_name": channel.name,
+                        "channel_provider": channel.provider,
+                        "source_format": source_format,
+                        "chunk_count": chunk_count,
+                        "raw_chunk_length": len(data_content),
+                        "stage": "streaming_json_decode",
+                    },
+                )
                 
                 # 特殊处理：如果数据内容看起来像[DONE]但被其他字符包围
                 if "[DONE]" in data_content:
@@ -755,9 +891,46 @@ async def handle_streaming_response(response, channel, request_data, source_form
             if end_marker:  # 只有非空的end_marker才发送
                 yield end_marker
     else:
-        error_detail = f"Streaming request failed with status {response.status_code}: {await response.aread()}"
-        logger.error(error_detail)
-        raise APIError(error_detail)
+        body_bytes = await response.aread()
+        try:
+            body_text = body_bytes.decode("utf-8", errors="replace")
+        except Exception:
+            body_text = str(body_bytes)
+
+        status = response.status_code
+        # 解析上游错误，生成友好的错误信息
+        friendly_error = _parse_upstream_error(channel.provider, status, body_text)
+
+        # 根据状态码分类错误类型
+        if status in (401, 403):
+            error_type = ERROR_TYPE_AUTH
+        elif status == 429:
+            error_type = ERROR_TYPE_RATE_LIMIT
+        else:
+            error_type = ERROR_TYPE_UPSTREAM_API
+
+        log_structured_error(
+            logger,
+            error_type=error_type,
+            request_body=request_data,
+            response_status=status,
+            response_headers=dict(response.headers),
+            response_body=body_text,
+            extra={
+                "channel_name": channel.name,
+                "channel_provider": channel.provider,
+                "source_format": source_format,
+                "is_streaming": True,
+                "stage": "streaming_response_status",
+                "friendly_error": friendly_error,
+            },
+        )
+
+        # 对于 400 错误，抛出 HTTPException 以便返回清晰的错误信息
+        if status == 400:
+            raise HTTPException(status_code=400, detail=friendly_error)
+
+        raise APIError(friendly_error)
 
 
 def handle_non_streaming_response(response, channel, request_data, source_format):
@@ -799,21 +972,67 @@ def handle_non_streaming_response(response, channel, request_data, source_format
     elif response.status_code == 429:
         error_data = response.json() if response.content else {}
         retry_after = "20"  # OpenAI 默认建议 20 秒
-        
+
         # 尝试从错误消息中提取具体等待时间
         if "error" in error_data and "message" in error_data["error"]:
             import re
             match = re.search(r'try again in (\d+)s', error_data["error"]["message"])
             if match:
                 retry_after = match.group(1)
-        
+
+        log_structured_error(
+            logger,
+            error_type=ERROR_TYPE_RATE_LIMIT,
+            request_body=request_data,
+            response_status=response.status_code,
+            response_headers=dict(response.headers),
+            response_body=error_data or response.text,
+            extra={
+                "channel_name": channel.name,
+                "channel_provider": channel.provider,
+                "source_format": source_format,
+                "retry_after": retry_after,
+                "stage": "non_streaming_response",
+            },
+        )
+
         # 抛出 HTTPException 由上层统一处理
         raise HTTPException(status_code=429, detail="Rate limit exceeded", headers={"Retry-After": retry_after})
-    
+
     else:
         error_text = response.text
-        logger.error(f"Target API request failed with status {response.status_code}: {error_text}")
-        raise APIError(f"Target API request failed with status {response.status_code}: {error_text}")
+        status = response.status_code
+
+        # 解析上游错误，生成友好的错误信息
+        friendly_error = _parse_upstream_error(channel.provider, status, error_text)
+
+        # 根据状态码分类错误类型
+        if status in (401, 403):
+            error_type = ERROR_TYPE_AUTH
+        else:
+            error_type = ERROR_TYPE_UPSTREAM_API
+
+        log_structured_error(
+            logger,
+            error_type=error_type,
+            request_body=request_data,
+            response_status=status,
+            response_headers=dict(response.headers),
+            response_body=error_text,
+            extra={
+                "channel_name": channel.name,
+                "channel_provider": channel.provider,
+                "source_format": source_format,
+                "stage": "non_streaming_response",
+                "friendly_error": friendly_error,
+            },
+        )
+
+        # 对于 400 错误，直接返回清晰的错误信息
+        if status == 400:
+            raise HTTPException(status_code=400, detail=friendly_error)
+
+        raise APIError(friendly_error)
 
 
 # --------------------------------------------------------------------
@@ -929,6 +1148,22 @@ async def unified_anthropic_format_endpoint(
 ):
     """Anthropic格式统一端点（使用标准Anthropic认证）"""
     return await handle_unified_request(request, api_key, source_format="anthropic")
+
+
+@router.post("/v1/messages/count_tokens")
+async def unified_anthropic_count_tokens_endpoint(
+    request: Request,
+    api_key: str = Depends(extract_anthropic_api_key)
+):
+    """Anthropic格式Token计数端点
+
+    接收与 /v1/messages 相同的请求格式，返回 input_tokens 数量。
+    支持转发到不同渠道：
+    - Anthropic 渠道：直接转发到 Anthropic API
+    - OpenAI 渠道：使用 tiktoken 估算
+    - Gemini 渠道：使用 Gemini countTokens API
+    """
+    return await handle_anthropic_count_tokens(request, api_key)
 
 
 @router.post("/v1beta/models/{model_id}:generateContent")
@@ -1052,30 +1287,49 @@ async def unified_gemini_count_tokens_endpoint(
 async def handle_unified_request(request, api_key: str, source_format: str):
     """统一请求处理逻辑"""
     try:
-        logger.debug(f"Processing request: source_format={source_format}, api_key={mask_api_key(api_key)}")
-        
         # 1. 根据key识别目标渠道
         channel = channel_manager.get_channel_by_custom_key(api_key)
         if not channel:
             logger.error(f"No channel found for api_key: {mask_api_key(api_key)}")
             raise HTTPException(status_code=401, detail="Invalid API key")
-        
+
         # 2. 获取请求数据
         request_data = await request.json()
 
         # 3. 验证必须字段
         if not request_data.get("model"):
             raise HTTPException(status_code=400, detail="Model name is required")
-        
+
         # Anthropic格式需要max_tokens字段
         if source_format == "anthropic" and not request_data.get("max_tokens"):
             raise HTTPException(status_code=400, detail="max_tokens is required for Anthropic format")
-        
-        logger.debug(f"Unified API: source_format={source_format}, key={mask_api_key(api_key)}, target_provider={channel.provider}")
-        logger.debug(f"Request stream parameter: {request_data.get('stream', False)}")
-        
-        # 4. 根据流式参数选择处理方式
+
+        # 验证 max_tokens 上限
+        max_tokens_limit = env_config.max_tokens_limit
+        if max_tokens_limit > 0:
+            requested_max_tokens = _extract_max_tokens(source_format, request_data)
+            if requested_max_tokens is not None and requested_max_tokens > max_tokens_limit:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"max_tokens ({requested_max_tokens}) exceeds limit ({max_tokens_limit})"
+                )
+
         is_streaming = request_data.get("stream", False)
+
+        # 4. 记录请求入口日志
+        log_request_entry(
+            logger,
+            request_method=request.method,
+            request_url=str(request.url),
+            request_headers=dict(request.headers),
+            source_format=source_format,
+            model=request_data.get("model"),
+            is_streaming=is_streaming,
+            channel_name=channel.name,
+            channel_provider=channel.provider,
+        )
+
+        # 5. 根据流式参数选择处理方式
         
         if is_streaming:
             # 流式请求
@@ -1123,8 +1377,38 @@ async def handle_unified_request(request, api_key: str, source_format: str):
         
     except HTTPException:
         raise
+    except ConversionError as e:
+        # 转换错误
+        log_structured_error(
+            logger,
+            error_type=ERROR_TYPE_CONVERSION,
+            exc=e,
+            request_method="POST",
+            request_url=str(request.url) if hasattr(request, 'url') else None,
+            request_headers=dict(request.headers) if hasattr(request, 'headers') else None,
+            request_body=request_data if 'request_data' in dir() else None,
+            extra={
+                "source_format": source_format,
+                "api_key": mask_api_key(api_key),
+                "stage": "handle_unified_request",
+            },
+        )
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Unified {source_format} API request failed: {e}")
+        log_structured_error(
+            logger,
+            error_type=ERROR_TYPE_UPSTREAM_API,
+            exc=e,
+            request_method="POST",
+            request_url=str(request.url) if hasattr(request, 'url') else None,
+            request_headers=dict(request.headers) if hasattr(request, 'headers') else None,
+            request_body=request_data if 'request_data' in dir() else None,
+            extra={
+                "source_format": source_format,
+                "api_key": mask_api_key(api_key),
+                "stage": "handle_unified_request",
+            },
+        )
         raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
 
 
@@ -1277,21 +1561,268 @@ async def handle_anthropic_count_tokens_for_gemini(channel: ChannelInfo, model_i
         estimated_tokens = max(1, int(char_count / 3.5))
         
         logger.info(f"Estimated token count for Anthropic (char-based): {estimated_tokens}")
-        
+
         # 构建Gemini格式的响应
         gemini_response = {
             "totalTokens": estimated_tokens
         }
-        
+
         return JSONResponse(
             content=gemini_response,
             status_code=200,
             headers={"Content-Type": "application/json; charset=utf-8"}
         )
-    
+
     except Exception as e:
         logger.error(f"Anthropic countTokens conversion failed: {e}")
         raise HTTPException(status_code=500, detail=f"Token counting failed: {e}")
+
+
+async def handle_anthropic_count_tokens(request: Request, api_key: str):
+    """处理 Anthropic /v1/messages/count_tokens 请求
+
+    根据渠道类型选择不同的 token 计数策略：
+    - Anthropic 渠道：直接转发到 Anthropic API
+    - OpenAI 渠道：使用 tiktoken 估算
+    - Gemini 渠道：转换格式后调用 Gemini countTokens API
+    """
+    try:
+        # 1. 获取渠道
+        channel = channel_manager.get_channel_by_custom_key(api_key)
+        if not channel:
+            logger.error(f"No channel found for api_key: {mask_api_key(api_key)}")
+            raise HTTPException(status_code=401, detail="Invalid API key")
+
+        # 2. 获取请求数据
+        request_data = await request.json()
+        model = request_data.get("model", "")
+
+        # 3. 应用模型映射
+        effective_model = model
+        if channel.models_mapping:
+            effective_model = channel.models_mapping.get(model, model)
+            if effective_model != model:
+                logger.info(f"Model mapping applied: {model} -> {effective_model}")
+
+        logger.info(f"Anthropic count_tokens request: model={model}, channel={channel.name}, provider={channel.provider}")
+
+        # 4. 根据渠道类型处理
+        if channel.provider == "anthropic":
+            return await _forward_anthropic_count_tokens(channel, request_data, effective_model)
+        elif channel.provider == "openai":
+            return await _estimate_tokens_with_tiktoken(request_data, effective_model)
+        elif channel.provider == "gemini":
+            return await _count_tokens_via_gemini(channel, request_data, effective_model)
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Channel provider '{channel.provider}' does not support count_tokens"
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Anthropic count_tokens request failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Token counting failed: {e}")
+
+
+async def _forward_anthropic_count_tokens(channel: ChannelInfo, request_data: dict, model: str):
+    """直接转发到 Anthropic count_tokens API"""
+    url = f"{channel.base_url.rstrip('/')}/v1/messages/count_tokens"
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": channel.api_key,
+        "anthropic-version": "2023-06-01",
+    }
+
+    # 更新请求中的 model
+    forward_data = {**request_data, "model": model}
+
+    logger.info(f"Forwarding count_tokens to Anthropic: {url}")
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(url, json=forward_data, headers=headers)
+
+        if response.status_code != 200:
+            logger.error(f"Anthropic count_tokens failed: {response.status_code} - {response.text}")
+            raise HTTPException(status_code=response.status_code, detail=response.text)
+
+        result = response.json()
+        logger.info(f"Anthropic count_tokens result: {result}")
+
+        return JSONResponse(
+            content=result,
+            status_code=200,
+            headers={"Content-Type": "application/json; charset=utf-8"}
+        )
+
+
+async def _estimate_tokens_with_tiktoken(request_data: dict, model: str):
+    """使用 tiktoken 估算 token 数量（OpenAI 渠道）"""
+    try:
+        import tiktoken
+    except ImportError:
+        logger.warning("tiktoken not installed, falling back to character-based estimation")
+        return await _estimate_tokens_by_chars(request_data)
+
+    # 提取所有文本内容
+    text_content = _extract_text_from_anthropic_request(request_data)
+
+    # 选择合适的编码器
+    try:
+        if "gpt-4" in model or "gpt-3.5" in model:
+            encoding = tiktoken.encoding_for_model(model)
+        else:
+            encoding = tiktoken.get_encoding("cl100k_base")
+    except Exception:
+        encoding = tiktoken.get_encoding("cl100k_base")
+
+    token_count = len(encoding.encode(text_content))
+    logger.info(f"tiktoken estimated tokens: {token_count}")
+
+    return JSONResponse(
+        content={"input_tokens": token_count},
+        status_code=200,
+        headers={"Content-Type": "application/json; charset=utf-8"}
+    )
+
+
+async def _count_tokens_via_gemini(channel: ChannelInfo, request_data: dict, model: str):
+    """通过 Gemini API 计算 token 数量"""
+    # 转换 Anthropic 格式到 Gemini 格式
+    gemini_contents = _convert_anthropic_messages_to_gemini_contents(request_data)
+
+    url = f"{channel.base_url.rstrip('/')}/models/{model}:countTokens"
+    if "?" in url:
+        url += f"&key={channel.api_key}"
+    else:
+        url += f"?key={channel.api_key}"
+
+    gemini_request = {"contents": gemini_contents}
+
+    logger.info(f"Forwarding count_tokens to Gemini: {url}")
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            url,
+            json=gemini_request,
+            headers={"Content-Type": "application/json"}
+        )
+
+        if response.status_code != 200:
+            logger.error(f"Gemini countTokens failed: {response.status_code} - {response.text}")
+            raise HTTPException(status_code=response.status_code, detail=response.text)
+
+        result = response.json()
+        total_tokens = result.get("totalTokens", 0)
+        logger.info(f"Gemini countTokens result: {total_tokens}")
+
+        # 转换为 Anthropic 响应格式
+        return JSONResponse(
+            content={"input_tokens": total_tokens},
+            status_code=200,
+            headers={"Content-Type": "application/json; charset=utf-8"}
+        )
+
+
+async def _estimate_tokens_by_chars(request_data: dict):
+    """基于字符数估算 token 数量（备用方案）"""
+    text_content = _extract_text_from_anthropic_request(request_data)
+
+    # Anthropic/OpenAI 大约 1 token ≈ 4 字符（英文），中文约 1.5 字符
+    char_count = len(text_content)
+    estimated_tokens = max(1, int(char_count / 3.5))
+
+    logger.info(f"Character-based token estimation: {char_count} chars -> {estimated_tokens} tokens")
+
+    return JSONResponse(
+        content={"input_tokens": estimated_tokens},
+        status_code=200,
+        headers={"Content-Type": "application/json; charset=utf-8"}
+    )
+
+
+def _extract_text_from_anthropic_request(request_data: dict) -> str:
+    """从 Anthropic 请求中提取所有文本内容"""
+    text_parts = []
+
+    # 提取 system prompt
+    system = request_data.get("system")
+    if isinstance(system, str):
+        text_parts.append(system)
+    elif isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text_parts.append(block.get("text", ""))
+
+    # 提取 messages
+    for msg in request_data.get("messages", []):
+        content = msg.get("content")
+        if isinstance(content, str):
+            text_parts.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    block_type = block.get("type", "")
+                    if block_type == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif block_type == "tool_use":
+                        text_parts.append(block.get("name", ""))
+                        text_parts.append(json.dumps(block.get("input", {})))
+                    elif block_type == "tool_result":
+                        result_content = block.get("content", "")
+                        if isinstance(result_content, str):
+                            text_parts.append(result_content)
+
+    # 提取 tools 定义
+    for tool in request_data.get("tools", []):
+        text_parts.append(tool.get("name", ""))
+        text_parts.append(tool.get("description", ""))
+        text_parts.append(json.dumps(tool.get("input_schema", {})))
+
+    return "\n".join(text_parts)
+
+
+def _convert_anthropic_messages_to_gemini_contents(request_data: dict) -> list:
+    """将 Anthropic messages 转换为 Gemini contents 格式"""
+    contents = []
+
+    # 添加 system prompt 作为第一条 user 消息
+    system = request_data.get("system")
+    if system:
+        system_text = system if isinstance(system, str) else system[0].get("text", "") if system else ""
+        if system_text:
+            contents.append({
+                "role": "user",
+                "parts": [{"text": f"[System]: {system_text}"}]
+            })
+
+    # 转换 messages
+    for msg in request_data.get("messages", []):
+        role = msg.get("role", "user")
+        gemini_role = "model" if role == "assistant" else "user"
+
+        parts = []
+        content = msg.get("content")
+        if isinstance(content, str):
+            parts.append({"text": content})
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    block_type = block.get("type", "")
+                    if block_type == "text":
+                        parts.append({"text": block.get("text", "")})
+                    elif block_type == "tool_use":
+                        parts.append({"text": f"[Tool Call: {block.get('name', '')}]"})
+                    elif block_type == "tool_result":
+                        result = block.get("content", "")
+                        parts.append({"text": f"[Tool Result]: {result}" if isinstance(result, str) else str(result)})
+
+        if parts:
+            contents.append({"role": gemini_role, "parts": parts})
+
+    return contents
 
 
 # 健康检查端点
