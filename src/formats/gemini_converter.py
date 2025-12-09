@@ -275,7 +275,13 @@ class GeminiConverter(BaseConverter):
                     })
         
         result_data["messages"] = messages
-        
+
+        # P2-14: safetySettings 透传到 metadata
+        if "safetySettings" in data:
+            metadata = result_data.get("metadata") or {}
+            metadata["gemini_safety_settings"] = data["safetySettings"]
+            result_data["metadata"] = metadata
+
         # 处理生成配置
         if "generationConfig" in data:
             config = data["generationConfig"]
@@ -287,7 +293,14 @@ class GeminiConverter(BaseConverter):
                 result_data["max_tokens"] = config["maxOutputTokens"]
             if "stopSequences" in config:
                 result_data["stop"] = config["stopSequences"]
-            
+            # P1: presencePenalty/frequencyPenalty/candidateCount 参数转换
+            if "presencePenalty" in config:
+                result_data["presence_penalty"] = config["presencePenalty"]
+            if "frequencyPenalty" in config:
+                result_data["frequency_penalty"] = config["frequencyPenalty"]
+            if "candidateCount" in config:
+                result_data["n"] = config["candidateCount"]
+
             # 处理结构化输出
             if config.get("response_mime_type") == "application/json":
                 result_data["response_format"] = {"type": "json_object"}
@@ -304,6 +317,10 @@ class GeminiConverter(BaseConverter):
         # 处理工具调用
         if "tools" in data:
             openai_tools = []
+            unsupported_tools = []
+            has_code_execution = False
+            has_google_search = False
+
             for tool in data["tools"]:
                 # Gemini官方使用 snake_case: function_declarations
                 func_key = None
@@ -311,6 +328,7 @@ class GeminiConverter(BaseConverter):
                     func_key = "function_declarations"
                 elif "functionDeclarations" in tool:  # 兼容旧写法
                     func_key = "functionDeclarations"
+
                 if func_key:
                     for func_decl in tool[func_key]:
                         openai_tools.append({
@@ -321,6 +339,66 @@ class GeminiConverter(BaseConverter):
                                 "parameters": self._sanitize_schema_for_openai(func_decl.get("parameters", {}))
                             }
                         })
+
+                # 检测非函数工具类型（与 func_key 独立处理）
+                if "code_execution" in tool:
+                    has_code_execution = True
+                if "google_search" in tool:
+                    has_google_search = True
+                if "google_search_retrieval" in tool:
+                    unsupported_tools.append("google_search_retrieval")
+                if "retrieval" in tool:
+                    unsupported_tools.append("retrieval")
+
+            # code_execution → 虚拟函数工具
+            if has_code_execution:
+                openai_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": "code_execution",
+                        "description": "Execute Python code. Caller must implement the execution handler.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "code": {"type": "string", "description": "Python code to execute"}
+                            },
+                            "required": ["code"]
+                        }
+                    }
+                })
+                self.logger.warning(
+                    "Gemini code_execution mapped to OpenAI function tool. "
+                    "Caller must implement the execution handler."
+                )
+
+            # P2-15: google_search → 虚拟函数工具
+            if has_google_search:
+                openai_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": "google_search",
+                        "description": "Web search using Google. Caller must implement the search handler.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "description": "Search query"}
+                            },
+                            "required": ["query"]
+                        }
+                    }
+                })
+                self.logger.warning(
+                    "Gemini google_search mapped to OpenAI function tool. "
+                    "Caller must implement the search handler."
+                )
+
+            # 记录不支持的工具警告（去重）
+            if unsupported_tools:
+                self.logger.warning(
+                    f"Gemini tools not supported for OpenAI conversion: {list(set(unsupported_tools))}. "
+                    "These tools will be ignored in the converted request."
+                )
+
             if openai_tools:
                 result_data["tools"] = openai_tools
                 result_data["tool_choice"] = "auto"
@@ -453,15 +531,26 @@ class GeminiConverter(BaseConverter):
                 # 优先级3：都没有则报错，要求用户明确指定
                 raise ValueError(f"max_tokens is required for Anthropic API. Please specify max_tokens in generationConfig.maxOutputTokens or set ANTHROPIC_MAX_TOKENS environment variable.")
         
+        # P2-14: safetySettings 透传到 metadata
+        if "safetySettings" in data:
+            metadata = result_data.get("metadata") or {}
+            metadata["gemini_safety_settings"] = data["safetySettings"]
+            result_data["metadata"] = metadata
+
         # 处理工具调用
         if "tools" in data:
             anthropic_tools = []
+            unsupported_tools = []
+            has_code_execution = False
+            has_google_search = False
+
             for tool in data["tools"]:
                 func_key = None
                 if "function_declarations" in tool:
                     func_key = "function_declarations"
                 elif "functionDeclarations" in tool:  # 兼容旧写法
                     func_key = "functionDeclarations"
+
                 if func_key:
                     for func_decl in tool[func_key]:
                         anthropic_tools.append({
@@ -469,6 +558,60 @@ class GeminiConverter(BaseConverter):
                             "description": func_decl.get("description", ""),
                             "input_schema": self._convert_schema_for_anthropic(func_decl.get("parameters", {}))
                         })
+
+                # 检测非函数工具类型（与 func_key 独立处理）
+                if "code_execution" in tool:
+                    has_code_execution = True
+                if "google_search" in tool:
+                    has_google_search = True
+                if "google_search_retrieval" in tool:
+                    unsupported_tools.append("google_search_retrieval")
+                if "retrieval" in tool:
+                    unsupported_tools.append("retrieval")
+
+            # code_execution → 虚拟工具
+            if has_code_execution:
+                anthropic_tools.append({
+                    "name": "code_execution",
+                    "description": "Execute Python code. Caller must implement the execution handler.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "code": {"type": "string", "description": "Python code to execute"}
+                        },
+                        "required": ["code"]
+                    }
+                })
+                self.logger.warning(
+                    "Gemini code_execution mapped to Anthropic tool. "
+                    "Caller must implement the execution handler."
+                )
+
+            # P2-15: google_search → 虚拟工具
+            if has_google_search:
+                anthropic_tools.append({
+                    "name": "google_search",
+                    "description": "Web search using Google. Caller must implement the search handler.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "Search query"}
+                        },
+                        "required": ["query"]
+                    }
+                })
+                self.logger.warning(
+                    "Gemini google_search mapped to Anthropic tool. "
+                    "Caller must implement the search handler."
+                )
+
+            # 记录不支持的工具警告（去重）
+            if unsupported_tools:
+                self.logger.warning(
+                    f"Gemini tools not supported for Anthropic conversion: {list(set(unsupported_tools))}. "
+                    "These tools will be ignored in the converted request."
+                )
+
             if anthropic_tools:
                 result_data["tools"] = anthropic_tools
         
@@ -993,16 +1136,76 @@ class GeminiConverter(BaseConverter):
                     "text": part["text"]
                 })
             elif "inlineData" in part:
-                # 转换图像格式
                 inline_data = part["inlineData"]
                 mime_type = inline_data.get("mimeType", "image/jpeg")
                 data_part = inline_data.get("data", "")
-                converted_content.append({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{mime_type};base64,{data_part}"
-                    }
-                })
+
+                if isinstance(mime_type, str) and mime_type.startswith("image/"):
+                    # 图像内容 → OpenAI image_url
+                    converted_content.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime_type};base64,{data_part}"
+                        }
+                    })
+                elif isinstance(mime_type, str) and mime_type.startswith("audio/"):
+                    # 音频内容 → OpenAI input_audio
+                    audio_format = self._get_audio_format_from_mime(mime_type)
+                    converted_content.append({
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": data_part,
+                            "format": audio_format
+                        }
+                    })
+                elif isinstance(mime_type, str) and mime_type.startswith("video/"):
+                    # 视频内容：OpenAI不直接支持，记录警告
+                    self.logger.warning(f"Video content (mimeType={mime_type}) not supported for OpenAI, skipping")
+                else:
+                    # 未知类型或非字符串，记录警告避免静默失败
+                    self.logger.warning(f"Unsupported inlineData mimeType: {mime_type}, skipping")
+            elif "fileData" in part:
+                # P2-16: fileData 内容（GCS 文件引用）→ 文本占位符
+                file_data = part.get("fileData") or {}
+                mime_type = file_data.get("mimeType", "")
+                file_uri = file_data.get("fileUri", "")
+                placeholder = f"[fileData: mimeType={mime_type or 'unknown'}, uri={file_uri or 'unknown'}]"
+                text_content += placeholder
+                converted_content.append({"type": "text", "text": placeholder})
+                self.logger.warning(f"Gemini fileData converted to text placeholder (uri={file_uri})")
+            elif "executableCode" in part or "executable_code" in part:
+                # Gemini 代码执行工具返回的可执行代码片段
+                code_info = part.get("executableCode") or part.get("executable_code") or {}
+                language = code_info.get("language", "python")
+                code = code_info.get("code", "")
+
+                # 转换为 Markdown fenced code block
+                fence_lang = language if isinstance(language, str) else "python"
+                code_block = f"```{fence_lang}\n{code}\n```"
+                text_content += code_block
+                converted_content.append({"type": "text", "text": code_block})
+                self.logger.warning(
+                    "Gemini executableCode converted to fenced code block. "
+                    "OpenAI/Anthropic will not execute this code automatically."
+                )
+            elif "codeExecutionResult" in part or "code_execution_result" in part:
+                # Gemini 代码执行结果
+                result_info = part.get("codeExecutionResult") or part.get("code_execution_result") or {}
+                outcome = result_info.get("outcome")
+                output = result_info.get("output", "")
+
+                lines = ["[code_execution_result]"]
+                if outcome:
+                    lines.append(f"outcome: {outcome}")
+                if output:
+                    lines.append(f"output:\n{output}")
+
+                result_text = "\n".join(lines)
+                text_content += result_text
+                converted_content.append({"type": "text", "text": result_text})
+                self.logger.warning(
+                    "Gemini codeExecutionResult converted to plain text."
+                )
             elif "functionCall" in part:
                 # 转换函数调用
                 fc = part["functionCall"]
@@ -1075,16 +1278,63 @@ class GeminiConverter(BaseConverter):
                             "text": text_content
                         })
             elif "inlineData" in part:
-                # 转换图像格式
                 inline_data = part["inlineData"]
-                anthropic_content.append({
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": inline_data.get("mimeType", "image/jpeg"),
-                        "data": inline_data.get("data", "")
-                    }
-                })
+                mime_type = inline_data.get("mimeType", "image/jpeg")
+                data_part = inline_data.get("data", "")
+
+                if isinstance(mime_type, str) and mime_type.startswith("image/"):
+                    # 图像内容 → Anthropic image
+                    anthropic_content.append({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": mime_type,
+                            "data": data_part
+                        }
+                    })
+                elif isinstance(mime_type, str) and mime_type.startswith("audio/"):
+                    # 音频内容：Anthropic不直接支持，记录警告
+                    self.logger.warning(f"Audio content (mimeType={mime_type}) not supported for Anthropic, skipping")
+                elif isinstance(mime_type, str) and mime_type.startswith("video/"):
+                    # 视频内容：Anthropic不直接支持，记录警告
+                    self.logger.warning(f"Video content (mimeType={mime_type}) not supported for Anthropic, skipping")
+                else:
+                    # 未知类型，记录警告
+                    self.logger.warning(f"Unsupported inlineData mimeType: {mime_type}, skipping")
+            elif "fileData" in part:
+                # P2-16: fileData 内容（GCS 文件引用）→ 文本占位符
+                file_data = part.get("fileData") or {}
+                mime_type = file_data.get("mimeType", "")
+                file_uri = file_data.get("fileUri", "")
+                placeholder = f"[fileData: mimeType={mime_type or 'unknown'}, uri={file_uri or 'unknown'}]"
+                anthropic_content.append({"type": "text", "text": placeholder})
+                self.logger.warning(f"Gemini fileData converted to text placeholder for Anthropic (uri={file_uri})")
+            elif "executableCode" in part or "executable_code" in part:
+                # Gemini 代码执行工具返回的可执行代码片段 → 转为文本
+                code_info = part.get("executableCode") or part.get("executable_code") or {}
+                language = code_info.get("language", "python")
+                code = code_info.get("code", "")
+                fence_lang = language if isinstance(language, str) else "python"
+                code_block = f"```{fence_lang}\n{code}\n```"
+                anthropic_content.append({"type": "text", "text": code_block})
+                self.logger.warning(
+                    "Gemini executableCode converted to text for Anthropic."
+                )
+            elif "codeExecutionResult" in part or "code_execution_result" in part:
+                # Gemini 代码执行结果 → 转为文本
+                result_info = part.get("codeExecutionResult") or part.get("code_execution_result") or {}
+                outcome = result_info.get("outcome")
+                output = result_info.get("output", "")
+                lines = ["[code_execution_result]"]
+                if outcome:
+                    lines.append(f"outcome: {outcome}")
+                if output:
+                    lines.append(f"output:\n{output}")
+                result_text = "\n".join(lines)
+                anthropic_content.append({"type": "text", "text": result_text})
+                self.logger.warning(
+                    "Gemini codeExecutionResult converted to text for Anthropic."
+                )
             elif "functionCall" in part:
                 # 转换工具调用 (functionCall → tool_use)
                 func_call = part["functionCall"]
@@ -1162,7 +1412,38 @@ class GeminiConverter(BaseConverter):
         
         # 返回内容块数组
         return anthropic_content
-    
+
+    def _get_audio_format_from_mime(self, mime_type: str) -> str:
+        """从音频MIME类型中提取格式字符串
+
+        Args:
+            mime_type: 音频MIME类型，如 'audio/wav', 'audio/mpeg'
+
+        Returns:
+            OpenAI支持的音频格式字符串，如 'wav', 'mp3'
+        """
+        if not mime_type or "/" not in mime_type:
+            return "wav"
+
+        subtype = mime_type.split("/")[1].lower()
+
+        # 去掉常见前缀（如 x-wav）
+        if subtype.startswith("x-"):
+            subtype = subtype[2:]
+
+        # MIME子类型到OpenAI格式的映射
+        format_mapping = {
+            "mpeg": "mp3",
+            "mp3": "mp3",
+            "wav": "wav",
+            "wave": "wav",
+            "webm": "webm",
+            "ogg": "ogg",
+            "flac": "flac",
+        }
+
+        return format_mapping.get(subtype, subtype or "wav")
+
     def _sanitize_schema_for_openai(self, schema: Dict[str, Any]) -> Dict[str, Any]:
         """将Gemini格式的JSON Schema转换为OpenAI兼容的格式"""
         if not isinstance(schema, dict):

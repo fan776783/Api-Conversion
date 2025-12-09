@@ -403,6 +403,63 @@ def _sanitize_schema_for_openai(self, schema: Dict[str, Any]) -> Dict[str, Any]:
     return convert_types(copy.deepcopy(schema))
 ```
 
+#### 6.1 非函数工具转换（虚拟工具映射）
+
+Gemini 特有的非函数工具会被转换为虚拟函数工具，由调用方实现：
+
+| Gemini 工具 | OpenAI 映射 | 说明 |
+|------------|-------------|------|
+| `code_execution` | `function: code_execution` | 代码执行工具，参数: `{code: string}` |
+| `google_search` | `function: google_search` | Google 搜索工具，参数: `{query: string}` |
+| `google_search_retrieval` | 警告并忽略 | 不支持 |
+| `retrieval` | 警告并忽略 | 不支持 |
+
+**代码实现示例**：
+```python
+# code_execution → 虚拟函数工具
+if has_code_execution:
+    openai_tools.append({
+        "type": "function",
+        "function": {
+            "name": "code_execution",
+            "description": "Execute Python code. Caller must implement the execution handler.",
+            "parameters": {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]}
+        }
+    })
+```
+
+#### 6.2 代码执行响应转换
+
+Gemini 的 `executableCode` 和 `codeExecutionResult` 响应部分转换为文本：
+
+| Gemini 部分 | 转换结果 |
+|------------|---------|
+| `executableCode` | Markdown fenced code block: `` ```python\n{code}\n``` `` |
+| `codeExecutionResult` | 文本: `[code_execution_result]\noutcome: {outcome}\noutput:\n{output}` |
+
+#### 6.3 多模态内容处理
+
+| Gemini 内容类型 | OpenAI 转换 | 说明 |
+|----------------|-------------|------|
+| `inlineData` (image/*) | `image_url` | Base64 图像 |
+| `inlineData` (audio/*) | `input_audio` | 音频数据 |
+| `inlineData` (video/*) | 警告并跳过 | OpenAI 不支持 |
+| `fileData` | 文本占位符 | `[fileData: mimeType=..., uri=...]` |
+
+#### 6.4 生成配置参数扩展
+
+新增支持的 `generationConfig` 参数：
+
+| Gemini 参数 | OpenAI 映射 |
+|------------|------------|
+| `presencePenalty` | `presence_penalty` |
+| `frequencyPenalty` | `frequency_penalty` |
+| `candidateCount` | `n` |
+
+#### 6.5 安全设置透传
+
+Gemini 的 `safetySettings` 会被保存到请求的 `metadata.gemini_safety_settings` 中，供下游中间件或日志使用。
+
 #### 7. 思考模式转换（重点）
 
 Gemini 的 `thinkingConfig.thinkingBudget` 转换为 OpenAI 的 `reasoning_effort` + `max_completion_tokens`：

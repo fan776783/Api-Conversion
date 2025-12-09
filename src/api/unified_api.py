@@ -1464,19 +1464,40 @@ async def handle_gemini_count_tokens(channel: ChannelInfo, model_id: str, reques
 async def handle_openai_count_tokens_for_gemini(channel: ChannelInfo, model_id: str, request_data: dict):
     """处理OpenAI渠道的countTokens请求，转换为Gemini格式响应"""
     logger.info(f"Handling OpenAI countTokens for Gemini format request, model: {model_id}")
-    
+
     try:
-        # 从Gemini格式的contents提取文本用于token计数
-        contents = request_data.get("contents", [])
+        # 从Gemini格式的contents和systemInstruction提取文本用于token计数
         text_to_count = ""
-        
+        multimodal_token_estimate = 0
+
+        # P1: 处理 systemInstruction
+        system_instruction = request_data.get("systemInstruction") or request_data.get("system_instruction")
+        if system_instruction:
+            if isinstance(system_instruction, str):
+                text_to_count += system_instruction + "\n"
+            elif isinstance(system_instruction, dict):
+                sys_parts = system_instruction.get("parts", [])
+                for part in sys_parts:
+                    if isinstance(part, dict) and "text" in part:
+                        text_to_count += part["text"] + "\n"
+
+        contents = request_data.get("contents", [])
         for content in contents:
             if isinstance(content, dict):
                 parts = content.get("parts", [])
                 for part in parts:
-                    if isinstance(part, dict) and "text" in part:
-                        text_to_count += part["text"] + "\n"
-        
+                    if isinstance(part, dict):
+                        if "text" in part:
+                            text_to_count += part["text"] + "\n"
+                        elif "inlineData" in part:
+                            # 多模态内容估算：图片约 85 tokens, 视频/音频按时长估算
+                            mime_type = part["inlineData"].get("mimeType", "")
+                            if mime_type.startswith("image/"):
+                                multimodal_token_estimate += 85
+                            elif mime_type.startswith("video/") or mime_type.startswith("audio/"):
+                                # 假设每秒约 32 tokens, 默认估算 10 秒
+                                multimodal_token_estimate += 320
+
         logger.info(f"Extracted text for token counting: {text_to_count[:200]}...")
         
         # 使用tiktoken计算token数量
@@ -1491,10 +1512,10 @@ async def handle_openai_count_tokens_for_gemini(channel: ChannelInfo, model_id: 
             # 默认使用cl100k_base编码（适用于大多数现代模型）
             encoding = tiktoken.get_encoding("cl100k_base")
         
-        # 计算token数量
-        token_count = len(encoding.encode(text_to_count))
-        logger.info(f"Calculated token count: {token_count}")
-        
+        # 计算token数量（文本 + 多模态估算）
+        token_count = len(encoding.encode(text_to_count)) + multimodal_token_estimate
+        logger.info(f"Calculated token count: {token_count} (multimodal estimate: {multimodal_token_estimate})")
+
         # 构建Gemini格式的响应
         gemini_response = {
             "totalTokens": token_count
@@ -1509,25 +1530,43 @@ async def handle_openai_count_tokens_for_gemini(channel: ChannelInfo, model_id: 
     except ImportError:
         # 如果tiktoken不可用，回退到简单的字符数估算
         logger.warning("tiktoken not available, using character-based estimation")
-        
-        contents = request_data.get("contents", [])
+
         text_to_count = ""
-        
+        multimodal_token_estimate = 0
+
+        # 处理 systemInstruction
+        system_instruction = request_data.get("systemInstruction") or request_data.get("system_instruction")
+        if system_instruction:
+            if isinstance(system_instruction, str):
+                text_to_count += system_instruction + "\n"
+            elif isinstance(system_instruction, dict):
+                for part in system_instruction.get("parts", []):
+                    if isinstance(part, dict) and "text" in part:
+                        text_to_count += part["text"] + "\n"
+
+        contents = request_data.get("contents", [])
         for content in contents:
             if isinstance(content, dict):
                 parts = content.get("parts", [])
                 for part in parts:
-                    if isinstance(part, dict) and "text" in part:
-                        text_to_count += part["text"] + "\n"
-        
+                    if isinstance(part, dict):
+                        if "text" in part:
+                            text_to_count += part["text"] + "\n"
+                        elif "inlineData" in part:
+                            mime_type = part["inlineData"].get("mimeType", "")
+                            if mime_type.startswith("image/"):
+                                multimodal_token_estimate += 85
+                            elif mime_type.startswith("video/") or mime_type.startswith("audio/"):
+                                multimodal_token_estimate += 320
+
         # 简单估算：平均4个字符=1个token
-        estimated_tokens = len(text_to_count) // 4
+        estimated_tokens = len(text_to_count) // 4 + multimodal_token_estimate
         logger.info(f"Estimated token count (character-based): {estimated_tokens}")
-        
+
         gemini_response = {
             "totalTokens": estimated_tokens
         }
-        
+
         return JSONResponse(
             content=gemini_response,
             status_code=200,
@@ -1542,26 +1581,44 @@ async def handle_openai_count_tokens_for_gemini(channel: ChannelInfo, model_id: 
 async def handle_anthropic_count_tokens_for_gemini(channel: ChannelInfo, model_id: str, request_data: dict):
     """处理Anthropic渠道的countTokens请求，转换为Gemini格式响应"""
     logger.info(f"Handling Anthropic countTokens for Gemini format request, model: {model_id}")
-    
+
     try:
-        # 从Gemini格式的contents提取文本用于token计数
-        contents = request_data.get("contents", [])
+        # 从Gemini格式的contents和systemInstruction提取文本用于token计数
         text_to_count = ""
-        
+        multimodal_token_estimate = 0
+
+        # P1: 处理 systemInstruction
+        system_instruction = request_data.get("systemInstruction") or request_data.get("system_instruction")
+        if system_instruction:
+            if isinstance(system_instruction, str):
+                text_to_count += system_instruction + "\n"
+            elif isinstance(system_instruction, dict):
+                for part in system_instruction.get("parts", []):
+                    if isinstance(part, dict) and "text" in part:
+                        text_to_count += part["text"] + "\n"
+
+        contents = request_data.get("contents", [])
         for content in contents:
             if isinstance(content, dict):
                 parts = content.get("parts", [])
                 for part in parts:
-                    if isinstance(part, dict) and "text" in part:
-                        text_to_count += part["text"] + "\n"
-        
+                    if isinstance(part, dict):
+                        if "text" in part:
+                            text_to_count += part["text"] + "\n"
+                        elif "inlineData" in part:
+                            mime_type = part["inlineData"].get("mimeType", "")
+                            if mime_type.startswith("image/"):
+                                multimodal_token_estimate += 85
+                            elif mime_type.startswith("video/") or mime_type.startswith("audio/"):
+                                multimodal_token_estimate += 320
+
         logger.info(f"Extracted text for token counting (Anthropic): {text_to_count[:200]}...")
-        
+
         # Anthropic API没有专门的token计数端点，我们使用估算方法
         # Anthropic的token计算大致是：1 token ≈ 3.5个字符（英文）
         char_count = len(text_to_count)
-        estimated_tokens = max(1, int(char_count / 3.5))
-        
+        estimated_tokens = max(1, int(char_count / 3.5)) + multimodal_token_estimate
+
         logger.info(f"Estimated token count for Anthropic (char-based): {estimated_tokens}")
 
         # 构建Gemini格式的响应
