@@ -2,12 +2,12 @@ version: "3.8"
 
 services:
   api:
-    # 使用预构建镜像（推荐）
-    image: ghcr.io/chinrain/api-conversion:0.2.4
-    # 或者本地构建（取消下面的注释，并注释掉上面的 image）
-    # build:
-    #   context: .
-    #   dockerfile: Dockerfile
+    # 使用预构建镜像
+    # image: ghcr.io/chinrain/api-conversion:0.2.4
+    # 本地构建
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: api-conversion
     ports:
       - "8000:8000"
