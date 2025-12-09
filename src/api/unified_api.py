@@ -6,6 +6,7 @@ import json
 import time
 from datetime import datetime
 from typing import Dict, Any, Optional, List
+from urllib.parse import urlencode, parse_qsl
 import httpx
 from fastapi import APIRouter, HTTPException, Request, Response, Depends, Header
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -1895,6 +1896,82 @@ async def health_check():
     }
 
 
+# Gateway Anthropic count_tokens 端点（必须在通用 gateway_proxy 之前定义）
+@router.post("/gateway/v1/messages/count_tokens")
+async def gateway_anthropic_count_tokens(request: Request):
+    """Gateway 模式下的 Anthropic /v1/messages/count_tokens 端点
+
+    根据 GatewayConfig.provider 选择不同的 token 计数策略：
+    - provider == 'anthropic'：转发到 Anthropic /v1/messages/count_tokens
+    - provider == 'openai'：使用 tiktoken 在本地估算
+    - provider == 'gemini'：转换为 Gemini contents 后调用 /models/{model}:countTokens
+    """
+    config = load_gateway_config()
+    if not config or not config.enabled:
+        raise HTTPException(status_code=503, detail="Gateway is not configured or disabled")
+
+    try:
+        request_data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON request body")
+
+    if not isinstance(request_data, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+
+    api_key = extract_anthropic_api_key(
+        x_api_key=request.headers.get("x-api-key"),
+        authorization=request.headers.get("authorization"),
+    )
+
+    original_model = request_data.get("model", "")
+    if not original_model:
+        raise HTTPException(status_code=400, detail="model is required for count_tokens")
+    effective_model = original_model
+    if config.model_mapping:
+        effective_model = config.model_mapping.get(original_model, original_model)
+        if effective_model != original_model:
+            logger.info(f"Gateway count_tokens model mapping: {original_model} -> {effective_model}")
+
+    logger.info(
+        f"Gateway count_tokens: provider={config.provider}, "
+        f"model={original_model}, effective_model={effective_model}"
+    )
+
+    try:
+        if config.provider == "anthropic":
+            temp_channel = ChannelInfo(
+                id="gateway", name="Gateway", provider="anthropic",
+                base_url=config.base_url, api_key=api_key, custom_key="__gateway__",
+                timeout=config.timeout, max_retries=config.max_retries, enabled=True,
+                models_mapping=config.model_mapping, created_at="", updated_at=""
+            )
+            return await _forward_anthropic_count_tokens(temp_channel, request_data, effective_model)
+
+        elif config.provider == "openai":
+            return await _estimate_tokens_with_tiktoken(request_data, effective_model)
+
+        elif config.provider == "gemini":
+            temp_channel = ChannelInfo(
+                id="gateway", name="Gateway", provider="gemini",
+                base_url=config.base_url, api_key=api_key, custom_key="__gateway__",
+                timeout=config.timeout, max_retries=config.max_retries, enabled=True,
+                models_mapping=config.model_mapping, created_at="", updated_at=""
+            )
+            return await _count_tokens_via_gemini(temp_channel, request_data, effective_model)
+
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Gateway provider '{config.provider}' does not support count_tokens"
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Gateway count_tokens failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Token counting failed: {e}")
+
+
 # Gateway 转发端点
 @router.api_route("/gateway/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def gateway_proxy(full_path: str, request: Request):
@@ -1926,6 +2003,19 @@ async def gateway_proxy(full_path: str, request: Request):
     except Exception as e:
         logger.warning(f"Failed to detect request format: {e}, defaulting to openai")
         source_format = "openai"
+
+    # 3.1 Gemini 格式：从 URL 路径中提取 model（Gemini 请求的 model 在 URL 而非请求体中）
+    if source_format == "gemini" and isinstance(request_data, dict) and not request_data.get("model"):
+        # 匹配 /v1beta/models/{model_id}:generateContent 或 :streamGenerateContent
+        path_for_match = "/" + full_path.lstrip("/") if full_path else ""
+        marker = "/models/"
+        idx = path_for_match.find(marker)
+        if idx != -1:
+            model_and_action = path_for_match[idx + len(marker):]
+            model_id = model_and_action.split(":", 1)[0]
+            if model_id:
+                request_data["model"] = model_id
+                logger.debug(f"Extracted Gemini model from URL path: {model_id}")
 
     # 4. 提取用户 API Key（根据源格式）
     if source_format == "openai":
@@ -1977,6 +2067,9 @@ async def gateway_proxy(full_path: str, request: Request):
         original_url = str(request.url)
         if ":streamGenerateContent" in original_url and "alt=sse" in original_url:
             is_streaming = True
+            # 必须同步设置 request_data，确保转换到 OpenAI/Anthropic 时包含 stream 字段
+            if isinstance(request_data, dict):
+                request_data["stream"] = True
     original_model = request_data.get("model")
 
     # 6. 记录请求日志
@@ -2023,13 +2116,25 @@ async def gateway_proxy(full_path: str, request: Request):
             logger.info(f"Gateway model mapping: {original_model} -> {mapped}")
             converted_data["model"] = mapped
 
-    # 9. 构造目标 URL（保留子路径）
-    base = config.base_url.rstrip("/")
-    path = "/" + full_path.lstrip("/") if full_path else ""
-    query = str(request.url.query) if request.url.query else ""
+    # DEBUG: 打印转换后的完整请求 (使用 print 确保显示)
+    print(f"🔴🔴🔴 [DEBUG] converted_data keys: {list(converted_data.keys()) if isinstance(converted_data, dict) else 'not dict'}")
+    if isinstance(converted_data, dict) and "tools" in converted_data:
+        print(f"🔴🔴🔴 [DEBUG] tools: {json.dumps(converted_data['tools'], ensure_ascii=False, default=str)[:5000]}")
 
-    # 对于 Gemini，需要特殊处理 URL
+    # 9. 构造目标 URL（基于目标 provider，而非源格式路径）
+    base = config.base_url.rstrip("/")
+    raw_query = str(request.url.query) if request.url.query else ""
+    query = ""
+    if raw_query:
+        query_pairs = parse_qsl(raw_query, keep_blank_values=True)
+        # Gemini → 非 Gemini 跨格式转换时，移除 Gemini 专用参数
+        if source_format == "gemini" and config.provider != "gemini":
+            query_pairs = [(k, v) for k, v in query_pairs if k not in ("alt", "key")]
+        if query_pairs:
+            query = urlencode(query_pairs, doseq=True)
+
     if config.provider == "gemini" and request.method == "POST":
+        # Gemini 目标：构建 Gemini 格式 URL
         model = converted_data.get("model", original_model)
         if model:
             if is_streaming:
@@ -2037,8 +2142,20 @@ async def gateway_proxy(full_path: str, request: Request):
             else:
                 url = f"{base}/models/{model}:generateContent"
         else:
+            path = "/" + full_path.lstrip("/") if full_path else ""
+            url = f"{base}{path}"
+    elif request.method in ("POST", "PUT") and source_format != config.provider:
+        # 跨格式转换：使用目标 provider 的规范端点
+        if config.provider == "openai":
+            url = f"{base}/v1/chat/completions"
+        elif config.provider == "anthropic":
+            url = f"{base}/v1/messages"
+        else:
+            path = "/" + full_path.lstrip("/") if full_path else ""
             url = f"{base}{path}"
     else:
+        # 同源 provider 或非 POST/PUT，保留原始子路径
+        path = "/" + full_path.lstrip("/") if full_path else ""
         url = f"{base}{path}"
 
     if query:
@@ -2072,8 +2189,31 @@ async def gateway_proxy(full_path: str, request: Request):
                     ) as response:
                         if response.status_code != 200:
                             body = await response.aread()
-                            error_msg = _parse_upstream_error(config.provider, response.status_code, body.decode())
-                            raise HTTPException(status_code=response.status_code, detail=error_msg)
+                            body_text = body.decode("utf-8", errors="replace")
+                            status = response.status_code
+                            error_msg = _parse_upstream_error(config.provider, status, body_text)
+
+                            # 根据状态码分类错误类型
+                            if status in (401, 403):
+                                error_type = ERROR_TYPE_AUTH
+                            elif status == 429:
+                                error_type = ERROR_TYPE_RATE_LIMIT
+                            else:
+                                error_type = ERROR_TYPE_UPSTREAM_API
+
+                            log_structured_error(
+                                logger,
+                                error_type=error_type,
+                                request_method=request.method,
+                                request_url=url,
+                                request_headers=target_headers,
+                                request_body=converted_data if request.method in ("POST", "PUT") else None,
+                                response_status=status,
+                                response_headers=dict(response.headers),
+                                response_body=body_text,
+                                extra={"gateway": True, "provider": config.provider, "streaming": True},
+                            )
+                            raise HTTPException(status_code=status, detail=error_msg)
 
                         # 构造临时 channel 用于响应转换
                         temp_channel = ChannelInfo(
@@ -2113,8 +2253,31 @@ async def gateway_proxy(full_path: str, request: Request):
                 )
 
             if response.status_code != 200:
-                error_msg = _parse_upstream_error(config.provider, response.status_code, response.text)
-                raise HTTPException(status_code=response.status_code, detail=error_msg)
+                status = response.status_code
+                body_text = response.text
+                error_msg = _parse_upstream_error(config.provider, status, body_text)
+
+                # 根据状态码分类错误类型
+                if status in (401, 403):
+                    error_type = ERROR_TYPE_AUTH
+                elif status == 429:
+                    error_type = ERROR_TYPE_RATE_LIMIT
+                else:
+                    error_type = ERROR_TYPE_UPSTREAM_API
+
+                log_structured_error(
+                    logger,
+                    error_type=error_type,
+                    request_method=request.method,
+                    request_url=url,
+                    request_headers=target_headers,
+                    request_body=converted_data if request.method in ("POST", "PUT") else None,
+                    response_status=status,
+                    response_headers=dict(response.headers),
+                    response_body=body_text,
+                    extra={"gateway": True, "provider": config.provider, "streaming": False},
+                )
+                raise HTTPException(status_code=status, detail=error_msg)
 
             response_data = response.json()
 

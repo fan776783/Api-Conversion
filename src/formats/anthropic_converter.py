@@ -70,16 +70,9 @@ class AnthropicConverter(BaseConverter):
             self.logger.info("No budget_tokens provided, defaulting to reasoning_effort='high'")
             return "high"
         
-        # 从环境变量获取阈值配置
-        low_threshold_str = os.environ.get("ANTHROPIC_TO_OPENAI_LOW_REASONING_THRESHOLD")
-        high_threshold_str = os.environ.get("ANTHROPIC_TO_OPENAI_HIGH_REASONING_THRESHOLD")
-        
-        # 检查必需的环境变量
-        if low_threshold_str is None:
-            raise ConversionError("ANTHROPIC_TO_OPENAI_LOW_REASONING_THRESHOLD environment variable is required for intelligent reasoning_effort determination")
-        
-        if high_threshold_str is None:
-            raise ConversionError("ANTHROPIC_TO_OPENAI_HIGH_REASONING_THRESHOLD environment variable is required for intelligent reasoning_effort determination")
+        # 从环境变量获取阈值配置（带默认值）
+        low_threshold_str = os.environ.get("ANTHROPIC_TO_OPENAI_LOW_REASONING_THRESHOLD", "2048")
+        high_threshold_str = os.environ.get("ANTHROPIC_TO_OPENAI_HIGH_REASONING_THRESHOLD", "16384")
         
         try:
             low_threshold = int(low_threshold_str)

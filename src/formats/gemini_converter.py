@@ -1446,11 +1446,18 @@ class GeminiConverter(BaseConverter):
 
     def _sanitize_schema_for_openai(self, schema: Dict[str, Any]) -> Dict[str, Any]:
         """将Gemini格式的JSON Schema转换为OpenAI兼容的格式"""
-        if not isinstance(schema, dict):
-            return schema
-        
+        if not isinstance(schema, dict) or not schema:
+            # OpenAI 要求 parameters 必须是有效的 JSON Schema，至少需要 type 字段
+            return {"type": "object", "properties": {}}
+
         # 复制schema避免修改原始数据
         sanitized = copy.deepcopy(schema)
+
+        # 确保有 type 字段
+        if "type" not in sanitized:
+            sanitized["type"] = "object"
+        if sanitized.get("type") == "object" and "properties" not in sanitized:
+            sanitized["properties"] = {}
         
         # Gemini到OpenAI的类型映射
         type_mapping = {

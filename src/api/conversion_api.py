@@ -78,7 +78,8 @@ async def detect_request_format(request_data: Dict[str, Any], path: str) -> str:
     # 基于URL路径检测
     if "/openai/" in path or path.endswith("/chat/completions"):
         return "openai"
-    elif "/anthropic/" in path or path.endswith("/messages"):
+    elif "/anthropic/" in path or path.endswith("/messages") or "/v1/messages" in path:
+        # Anthropic: /anthropic/ 前缀，或以 /messages 结尾，或包含 /v1/messages（如 /v1/messages/count_tokens）
         return "anthropic"
     elif "/gemini/" in path or "generateContent" in path:
         return "gemini"
