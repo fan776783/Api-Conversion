@@ -3093,9 +3093,10 @@ body {
 }
 
 /* =========================
-   模型映射删除按钮（仅在映射区生效，功能不变）
+   模型映射删除按钮（渠道和 Gateway 映射区通用）
    ========================= */
-#model-mapping-section .btn-danger {
+#model-mapping-section .btn-danger,
+#gateway-model-mapping-section .btn-danger {
     padding: 6px 12px;
     border-radius: 8px;
     border: 1px solid var(--color-error-light, #ffcdd2);
@@ -3105,17 +3106,144 @@ body {
     transition: background .18s ease, filter .18s ease, transform .12s ease, box-shadow .18s ease;
 }
 
-#model-mapping-section .btn-danger:hover {
+#model-mapping-section .btn-danger:hover,
+#gateway-model-mapping-section .btn-danger:hover {
     filter: brightness(0.96);
     transform: translateY(-1px);
     box-shadow: 0 8px 20px rgba(220, 53, 69, 0.18);
 }
 
-#model-mapping-section .btn-danger:active {
+#model-mapping-section .btn-danger:active,
+#gateway-model-mapping-section .btn-danger:active {
     transform: translateY(0);
 }
 
-#model-mapping-section .btn-danger:focus-visible {
+#model-mapping-section .btn-danger:focus-visible,
+#gateway-model-mapping-section .btn-danger:focus-visible {
     outline: none;
     box-shadow: 0 0 0 3px rgba(220, 53, 69, 0.15), 0 4px 12px rgba(220, 53, 69, 0.12);
+}
+
+/* =========================
+   Gateway 配置区域样式
+   ========================= */
+.gateway-form-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+}
+
+.gateway-form-header h3 {
+    margin: 0;
+}
+
+
+.checkbox-label,
+.form-group .checkbox-label,
+.form-group label.checkbox-label {
+    display: flex !important;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    font-weight: 500;
+    text-transform: none;
+    margin-bottom: 0;
+}
+
+.checkbox-label input[type="checkbox"] {
+    width: 18px;
+    height: 18px;
+    cursor: pointer;
+}
+
+/* 状态徽章 */
+.status-badge {
+    display: inline-block;
+    padding: 6px 14px;
+    border-radius: 20px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+}
+
+.status-configured {
+    background: linear-gradient(135deg, rgba(76, 175, 80, 0.15) 0%, rgba(76, 175, 80, 0.08) 100%);
+    color: #2d7d32;
+    border: 1px solid rgba(76, 175, 80, 0.3);
+}
+
+.status-disabled {
+    background: linear-gradient(135deg, rgba(255, 152, 0, 0.15) 0%, rgba(255, 152, 0, 0.08) 100%);
+    color: #e65100;
+    border: 1px solid rgba(255, 152, 0, 0.3);
+}
+
+.status-unconfigured {
+    background: linear-gradient(135deg, rgba(158, 158, 158, 0.15) 0%, rgba(158, 158, 158, 0.08) 100%);
+    color: #616161;
+    border: 1px solid rgba(158, 158, 158, 0.3);
+}
+
+/* 通用表单区块样式 */
+.form-section {
+    background: var(--bg-tertiary);
+    border-radius: 12px;
+    padding: 20px;
+    margin-top: 20px;
+    border: 1px solid var(--border-primary);
+}
+
+.form-section h4 {
+    margin: 0 0 8px 0;
+    color: var(--text-primary);
+    font-size: 1.1rem;
+    font-weight: 600;
+}
+
+/* 模型映射行通用样式 */
+#model-mapping-rows,
+#gateway-model-mapping-rows {
+    display: grid;
+    grid-template-columns: 1fr 1fr auto;
+    gap: 10px;
+    margin-top: 16px;
+}
+
+#model-mapping-rows .mapping-row,
+#gateway-model-mapping-rows .mapping-row {
+    display: contents;
+}
+
+#model-mapping-rows input,
+#gateway-model-mapping-rows input {
+    padding: 10px 14px;
+    border: 1px solid var(--border-primary);
+    border-radius: 8px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-size: 0.9rem;
+}
+
+.btn-small {
+    padding: 6px 12px !important;
+    font-size: 0.85rem !important;
+}
+
+/* 模型映射响应式适配 */
+@media (max-width: 768px) {
+    #model-mapping-rows,
+    #gateway-model-mapping-rows {
+        grid-template-columns: 1fr;
+    }
+
+    #model-mapping-rows .mapping-row,
+    #gateway-model-mapping-rows .mapping-row {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding-bottom: 12px;
+        border-bottom: 1px solid var(--border-primary);
+        margin-bottom: 12px;
+    }
 }

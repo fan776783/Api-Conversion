@@ -23,6 +23,8 @@ from src.utils.logger import (
 from src.utils.exceptions import ChannelNotFoundError, ConversionError, APIError, TimeoutError
 from src.utils.http_client import get_http_client
 from src.utils.env_config import env_config
+from src.core.gateway_config import load_gateway_config
+from api.conversion_api import detect_request_format
 
 logger = setup_logger("unified_api")
 
@@ -1834,3 +1836,247 @@ async def health_check():
         "timestamp": time.time(),
         "version": "1.0.0"
     }
+
+
+# Gateway 转发端点
+@router.api_route("/gateway/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+async def gateway_proxy(full_path: str, request: Request):
+    """
+    Gateway 转发端点：
+    - 接收 Anthropic/Gemini/OpenAI 格式请求
+    - 转换为配置的目标 provider 格式
+    - 使用用户自带的 API Key 转发到目标 base_url
+    - 支持流式和非流式请求
+    """
+    # 1. 加载 Gateway 配置
+    config = load_gateway_config()
+    if not config or not config.enabled:
+        raise HTTPException(status_code=503, detail="Gateway is not configured or disabled")
+
+    # 2. 解析请求体（仅对 POST / PUT 解析 JSON）
+    request_data = {}
+    has_body = request.method in ("POST", "PUT")
+    if has_body:
+        try:
+            request_data = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON request body")
+
+    # 3. 检测源格式（基于路径 + 请求体结构）
+    detect_path = "/" + full_path if full_path else ""
+    try:
+        source_format = await detect_request_format(request_data, path=detect_path)
+    except Exception as e:
+        logger.warning(f"Failed to detect request format: {e}, defaulting to openai")
+        source_format = "openai"
+
+    # 4. 提取用户 API Key（根据源格式）
+    if source_format == "openai":
+        api_key = extract_openai_api_key(authorization=request.headers.get("authorization"))
+    elif source_format == "anthropic":
+        api_key = extract_anthropic_api_key(
+            x_api_key=request.headers.get("x-api-key"),
+            authorization=request.headers.get("authorization"),
+        )
+    elif source_format == "gemini":
+        api_key = extract_gemini_api_key(request)
+    else:
+        api_key = extract_openai_api_key(authorization=request.headers.get("authorization"))
+
+    logger.info(
+        f"Gateway request: source={source_format}, target={config.provider}, "
+        f"path=/gateway/{full_path}, api_key={mask_api_key(api_key)}"
+    )
+
+    # 5. 基础校验
+    if request.method in ("POST", "PUT"):
+        if not isinstance(request_data, dict):
+            raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+
+        model = request_data.get("model")
+        if not model and source_format != "gemini":
+            raise HTTPException(status_code=400, detail="Model name is required")
+
+        if source_format == "anthropic" and not request_data.get("max_tokens"):
+            raise HTTPException(status_code=400, detail="max_tokens is required for Anthropic format")
+
+        # max_tokens 上限校验
+        max_tokens_limit = env_config.max_tokens_limit
+        if max_tokens_limit > 0:
+            requested_max_tokens = _extract_max_tokens(source_format, request_data)
+            if requested_max_tokens and requested_max_tokens > max_tokens_limit:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"max_tokens ({requested_max_tokens}) exceeds limit ({max_tokens_limit})"
+                )
+
+    # 计算是否为流式请求
+    if has_body:
+        is_streaming = bool(request_data.get("stream", False))
+    else:
+        is_streaming = False
+    # Gemini 额外根据 URL 中的 :streamGenerateContent + alt=sse 检测
+    if not is_streaming and source_format == "gemini":
+        original_url = str(request.url)
+        if ":streamGenerateContent" in original_url and "alt=sse" in original_url:
+            is_streaming = True
+    original_model = request_data.get("model")
+
+    # 6. 记录请求日志
+    log_request_entry(
+        logger,
+        request_method=request.method,
+        request_url=str(request.url),
+        request_headers=dict(request.headers),
+        source_format=source_format,
+        model=original_model,
+        is_streaming=is_streaming,
+        channel_name="Gateway",
+        channel_provider=config.provider,
+    )
+
+    # 7. 请求格式转换（仅对有 JSON 请求体的方法）
+    if has_body:
+        if source_format == config.provider:
+            converted_data = request_data.copy()
+            # Gemini 不接受请求体中的 stream 字段
+            if config.provider == "gemini":
+                converted_data.pop("stream", None)
+        else:
+            conversion_result = convert_request(
+                source_format,
+                config.provider,
+                request_data,
+                headers=dict(request.headers),
+            )
+            if not conversion_result.success:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Request conversion failed: {conversion_result.error}",
+                )
+            converted_data = conversion_result.data or {}
+    else:
+        # 无请求体的方法（如 GET / DELETE）不做格式转换
+        converted_data = {}
+
+    # 8. 应用模型映射（仅对有请求体的场景）
+    if has_body and config.model_mapping and isinstance(converted_data, dict):
+        mapped = config.model_mapping.get(original_model) or config.model_mapping.get(converted_data.get("model"))
+        if mapped:
+            logger.info(f"Gateway model mapping: {original_model} -> {mapped}")
+            converted_data["model"] = mapped
+
+    # 9. 构造目标 URL（保留子路径）
+    base = config.base_url.rstrip("/")
+    path = "/" + full_path.lstrip("/") if full_path else ""
+    query = str(request.url.query) if request.url.query else ""
+
+    # 对于 Gemini，需要特殊处理 URL
+    if config.provider == "gemini" and request.method == "POST":
+        model = converted_data.get("model", original_model)
+        if model:
+            if is_streaming:
+                url = f"{base}/models/{model}:streamGenerateContent?alt=sse"
+            else:
+                url = f"{base}/models/{model}:generateContent"
+        else:
+            url = f"{base}{path}"
+    else:
+        url = f"{base}{path}"
+
+    if query:
+        url = f"{url}{'&' if '?' in url else '?'}{query}"
+
+    # 10. 构造目标请求头（使用用户 API Key）
+    target_headers = {"Content-Type": "application/json"}
+    if config.provider == "openai":
+        target_headers["Authorization"] = f"Bearer {api_key}"
+    elif config.provider == "anthropic":
+        target_headers["x-api-key"] = api_key
+        target_headers["anthropic-version"] = "2023-06-01"
+    elif config.provider == "gemini":
+        target_headers["x-goog-api-key"] = api_key
+        if is_streaming:
+            target_headers["Accept"] = "text/event-stream"
+
+    logger.debug(f"Gateway forwarding to: {url}")
+
+    # 11. 转发请求
+    try:
+        if is_streaming:
+            # 流式请求
+            async def stream_generator():
+                async with httpx.AsyncClient(timeout=config.timeout) as client:
+                    async with client.stream(
+                        request.method,
+                        url=url,
+                        json=converted_data if request.method in ("POST", "PUT") else None,
+                        headers=target_headers,
+                    ) as response:
+                        if response.status_code != 200:
+                            body = await response.aread()
+                            error_msg = _parse_upstream_error(config.provider, response.status_code, body.decode())
+                            raise HTTPException(status_code=response.status_code, detail=error_msg)
+
+                        # 构造临时 channel 用于响应转换
+                        temp_channel = ChannelInfo(
+                            id="gateway",
+                            name="Gateway",
+                            provider=config.provider,
+                            base_url=config.base_url,
+                            api_key=api_key,
+                            custom_key="__gateway__",
+                            timeout=config.timeout,
+                            max_retries=config.max_retries,
+                            enabled=True,
+                            models_mapping=config.model_mapping,
+                            created_at="",
+                            updated_at="",
+                        )
+                        async for chunk in handle_streaming_response(response, temp_channel, request_data, source_format):
+                            yield chunk
+
+            return StreamingResponse(
+                stream_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                }
+            )
+        else:
+            # 非流式请求
+            async with httpx.AsyncClient(timeout=config.timeout) as client:
+                response = await client.request(
+                    method=request.method,
+                    url=url,
+                    json=converted_data if request.method in ("POST", "PUT") else None,
+                    headers=target_headers,
+                )
+
+            if response.status_code != 200:
+                error_msg = _parse_upstream_error(config.provider, response.status_code, response.text)
+                raise HTTPException(status_code=response.status_code, detail=error_msg)
+
+            response_data = response.json()
+
+            # 响应格式转换（仅对 POST / PUT 做格式转换）
+            if has_body and source_format != config.provider:
+                response_result = convert_response(config.provider, source_format, response_data)
+                if response_result.success:
+                    response_data = response_result.data
+
+            return JSONResponse(
+                content=response_data,
+                status_code=200,
+                headers={"Content-Type": "application/json; charset=utf-8"}
+            )
+
+    except HTTPException:
+        raise
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail=f"Gateway timeout after {config.timeout} seconds")
+    except Exception as e:
+        logger.error(f"Gateway error: {e}")
+        raise HTTPException(status_code=502, detail=f"Gateway error: {str(e)}")

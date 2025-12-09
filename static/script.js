@@ -1483,3 +1483,201 @@ function showToast(message, type = 'info') {
         console.log(`[${type}]`, message);
     }
 }
+
+
+// ============ Gateway 配置管理 ============
+
+// 初始化 Gateway 配置
+async function initGatewayConfig() {
+    await loadGatewayConfig();
+    setupGatewayForm();
+}
+
+// 加载 Gateway 配置
+async function loadGatewayConfig() {
+    try {
+        const response = await fetch('/api/gateway/config');
+        const data = await response.json();
+
+        const statusBadge = document.getElementById('gatewayStatus');
+        const deleteBtn = document.getElementById('deleteGatewayBtn');
+
+        if (data.success && data.config) {
+            // 已配置
+            statusBadge.textContent = data.config.enabled ? '已启用' : '已禁用';
+            statusBadge.className = 'status-badge ' + (data.config.enabled ? 'status-configured' : 'status-disabled');
+            deleteBtn.style.display = 'inline-block';
+
+            // 填充表单
+            document.getElementById('gateway_provider').value = data.config.provider || '';
+            document.getElementById('gateway_base_url').value = data.config.base_url || '';
+            document.getElementById('gateway_timeout').value = data.config.timeout || 30;
+            document.getElementById('gateway_max_retries').value = data.config.max_retries || 1;
+            document.getElementById('gateway_enabled').checked = data.config.enabled !== false;
+
+            // 填充模型映射
+            const mappingContainer = document.getElementById('gateway-model-mapping-rows');
+            mappingContainer.innerHTML = '';
+            const mapping = data.config.model_mapping || {};
+            Object.entries(mapping).forEach(([from, to]) => {
+                addGatewayMappingRow(from, to);
+            });
+        } else {
+            // 未配置
+            statusBadge.textContent = '未配置';
+            statusBadge.className = 'status-badge status-unconfigured';
+            deleteBtn.style.display = 'none';
+        }
+    } catch (error) {
+        console.error('Failed to load gateway config:', error);
+    }
+}
+
+// 设置 Gateway 表单事件
+function setupGatewayForm() {
+    const form = document.getElementById('gatewayForm');
+    if (form) {
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            await saveGatewayConfig();
+        });
+    }
+
+    // 提供商变化时更新默认 URL
+    const providerSelect = document.getElementById('gateway_provider');
+    if (providerSelect) {
+        providerSelect.addEventListener('change', (e) => {
+            const defaultUrls = {
+                'openai': 'https://api.openai.com/v1',
+                'anthropic': 'https://api.anthropic.com',
+                'gemini': 'https://generativelanguage.googleapis.com/v1beta'
+            };
+            const urlInput = document.getElementById('gateway_base_url');
+            if (defaultUrls[e.target.value] && urlInput && !urlInput.value) {
+                urlInput.value = defaultUrls[e.target.value];
+            }
+        });
+    }
+}
+
+// 保存 Gateway 配置
+async function saveGatewayConfig() {
+    const form = document.getElementById('gatewayForm');
+    const submitBtn = form.querySelector('button[type="submit"]');
+
+    // 收集模型映射
+    const modelMapping = {};
+    const rows = document.querySelectorAll('#gateway-model-mapping-rows .mapping-row');
+    rows.forEach(row => {
+        const fromInput = row.querySelector('.mapping-from');
+        const toInput = row.querySelector('.mapping-to');
+        if (fromInput && toInput && fromInput.value.trim() && toInput.value.trim()) {
+            modelMapping[fromInput.value.trim()] = toInput.value.trim();
+        }
+    });
+
+    const config = {
+        provider: document.getElementById('gateway_provider').value,
+        base_url: document.getElementById('gateway_base_url').value,
+        timeout: parseInt(document.getElementById('gateway_timeout').value) || 30,
+        max_retries: parseInt(document.getElementById('gateway_max_retries').value) || 1,
+        enabled: document.getElementById('gateway_enabled').checked,
+        model_mapping: Object.keys(modelMapping).length > 0 ? modelMapping : null
+    };
+
+    try {
+        submitBtn.disabled = true;
+        submitBtn.textContent = '保存中...';
+
+        const response = await fetch('/api/gateway/config', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(config)
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            showToast('Gateway 配置已保存', 'success');
+            await loadGatewayConfig();
+        } else {
+            showToast('保存失败: ' + (data.message || '未知错误'), 'error');
+        }
+    } catch (error) {
+        showToast('保存失败: ' + error.message, 'error');
+    } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = '保存配置';
+    }
+}
+
+// 删除 Gateway 配置
+async function deleteGatewayConfig() {
+    if (!confirm('确定要删除 Gateway 配置吗？')) {
+        return;
+    }
+
+    try {
+        const response = await fetch('/api/gateway/config', {
+            method: 'DELETE'
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            showToast('Gateway 配置已删除', 'success');
+            // 重置表单
+            document.getElementById('gatewayForm').reset();
+            document.getElementById('gateway-model-mapping-rows').innerHTML = '';
+            await loadGatewayConfig();
+        } else {
+            showToast('删除失败: ' + (data.message || '未知错误'), 'error');
+        }
+    } catch (error) {
+        showToast('删除失败: ' + error.message, 'error');
+    }
+}
+
+// 添加 Gateway 模型映射行（使用安全 DOM API 避免 XSS）
+function addGatewayMappingRow(fromValue = '', toValue = '') {
+    const container = document.getElementById('gateway-model-mapping-rows');
+    const row = document.createElement('div');
+    row.className = 'mapping-row';
+    row.style.display = 'contents';
+
+    const fromInput = document.createElement('input');
+    fromInput.type = 'text';
+    fromInput.className = 'mapping-from';
+    fromInput.placeholder = '源模型名';
+    fromInput.value = fromValue || '';
+
+    const toInput = document.createElement('input');
+    toInput.type = 'text';
+    toInput.className = 'mapping-to';
+    toInput.placeholder = '目标模型名';
+    toInput.value = toValue || '';
+
+    const deleteBtn = document.createElement('button');
+    deleteBtn.type = 'button';
+    deleteBtn.className = 'btn-danger btn-small';
+    deleteBtn.textContent = '删除';
+    deleteBtn.addEventListener('click', () => row.remove());
+
+    row.appendChild(fromInput);
+    row.appendChild(toInput);
+    row.appendChild(deleteBtn);
+    container.appendChild(row);
+}
+
+// 暴露 Gateway 函数到全局作用域（因脚本是动态加载的）
+window.addGatewayMappingRow = addGatewayMappingRow;
+window.deleteGatewayConfig = deleteGatewayConfig;
+
+// 脚本加载完成后立即初始化 Gateway 配置
+// 注意：由于脚本是动态加载的，DOMContentLoaded 已经触发过了
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initGatewayConfig);
+} else {
+    // DOM 已加载完成，直接初始化
+    setTimeout(initGatewayConfig, 50);
+}

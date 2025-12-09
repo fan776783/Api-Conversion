@@ -2,10 +2,11 @@
 Anthropic格式转换器
 处理Anthropic API格式与其他格式之间的转换
 """
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple, Pattern
 import json
 import copy
 import os
+import re
 
 from .base_converter import BaseConverter, ConversionResult, ConversionError
 from .unified import UnifiedChatRequest, UnifiedChatResponse, UnifiedContent, UnifiedContentType
@@ -195,6 +196,23 @@ class AnthropicConverter(BaseConverter):
         # 1) 使用 UnifiedChatRequest 解析 Anthropic 请求
         unified_request = UnifiedChatRequest.from_anthropic(data)
 
+        # 1.1) 协议标签清理：对用户/系统输入做安全过滤，防止伪造协议标签注入
+        if unified_request.system:
+            unified_request.system = self._sanitize_protocol_tags(unified_request.system)
+
+        for msg in unified_request.messages:
+            # 只清理 user/system 侧内容，避免误改模型输出
+            if msg.role in ("user", "system"):
+                for content_block in msg.content:
+                    if content_block.type in (
+                        UnifiedContentType.TEXT,
+                        UnifiedContentType.THINKING,
+                    ):
+                        if isinstance(content_block.text, str):
+                            content_block.text = self._sanitize_protocol_tags(
+                                content_block.text
+                            )
+
         # 2) 工具定义清理（保持与 OpenAI 的 JSON Schema 兼容）
         if "tools" in data:
             cleaned_tools: List[Dict[str, Any]] = []
@@ -317,6 +335,8 @@ class AnthropicConverter(BaseConverter):
             # 确保系统指令内容不为空且为字符串
             system_content = str(data["system"]).strip() if data["system"] else ""
             if system_content:
+                # 对系统指令做协议标签过滤，防止伪造 <invoke>/<tool_result>/<thinking> 等标签
+                system_content = self._sanitize_protocol_tags(system_content)
                 result_data["system_instruction"] = {
                     "parts": [{"text": system_content}]
                 }
@@ -336,10 +356,14 @@ class AnthropicConverter(BaseConverter):
             
             gemini_contents = []
             for msg in data["messages"]:
-                parts_converted = self._convert_content_to_gemini(msg.get("content", ""))
+                anthropic_role = msg.get("role", "assistant")
+                # 传递 role 参数，以便对 user 消息做协议标签过滤
+                parts_converted = self._convert_content_to_gemini(
+                    msg.get("content", ""),
+                    role=anthropic_role
+                )
 
                 # -------- 修正角色映射：tool 消息保持为 tool --------------
-                anthropic_role = msg.get("role", "assistant")
                 if anthropic_role == "user":
                     role = "user"
                 elif anthropic_role == "assistant":
@@ -1167,12 +1191,24 @@ class AnthropicConverter(BaseConverter):
             return converted_content if len(converted_content) > 1 else converted_content[0].get("text", "") if converted_content else ""
         return content
     
-    def _convert_content_to_gemini(self, content: Any) -> List[Dict[str, Any]]:
-        """将 Anthropic 的 content 转为 Gemini parts 结构"""
+    def _convert_content_to_gemini(
+        self, content: Any, role: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """将 Anthropic 的 content 转为 Gemini parts 结构。
+
+        Args:
+            content: Anthropic 格式的消息内容
+            role: 消息角色，当为 "user" 时会对文本执行协议标签过滤
+
+        Returns:
+            Gemini parts 列表
+        """
+        is_user = role == "user"
 
         # 1. 纯文本
         if isinstance(content, str):
-            return [{"text": content}]
+            text_val = self._sanitize_protocol_tags(content) if is_user else content
+            return [{"text": text_val}]
 
         # 2. 列表（可能混杂多模态 / tool 消息）
         if isinstance(content, list):
@@ -1180,12 +1216,14 @@ class AnthropicConverter(BaseConverter):
             for item in content:
                 if not isinstance(item, dict):
                     continue
-                    
+
                 item_type = item.get("type")
 
                 # 2.1 普通文本
                 if item_type == "text":
                     text_content = item.get("text", "")
+                    if is_user and isinstance(text_content, str):
+                        text_content = self._sanitize_protocol_tags(text_content)
                     if text_content:  # 只添加非空文本
                         gemini_parts.append({"text": text_content})
 
@@ -1237,10 +1275,15 @@ class AnthropicConverter(BaseConverter):
                 return [fr]
             # 如果不是工具结果，转为文本
             content_text = content.get("text") or json.dumps(content, ensure_ascii=False)
+            if is_user and isinstance(content_text, str):
+                content_text = self._sanitize_protocol_tags(content_text)
             return [{"text": content_text}]
 
         # 4. 其它类型统一转字符串
-        return [{"text": str(content) if content else ""}]
+        text_val = str(content) if content else ""
+        if is_user and text_val:
+            text_val = self._sanitize_protocol_tags(text_val)
+        return [{"text": text_val}]
 
     # --------- 辅助：构造 functionResponse part ---------
     def _build_function_response(self, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1360,6 +1403,67 @@ class AnthropicConverter(BaseConverter):
             return reason_mappings[source_format][target_format].get(reason, "end_turn")
         except KeyError:
             return "end_turn"
+
+    # ==================== 协议标签安全过滤 ====================
+
+    # 预编译正则表达式，避免运行时重复编译
+    _DANGEROUS_BLOCK_PATTERN = None
+    _THINKING_TAG_PATTERN = None
+    _GENERIC_XML_TAG_PATTERN = None
+
+    @classmethod
+    def _get_sanitize_patterns(
+        cls,
+    ) -> Tuple[Pattern[str], Pattern[str], Pattern[str]]:
+        """延迟初始化正则表达式模式（线程安全的单例模式）"""
+        if cls._DANGEROUS_BLOCK_PATTERN is None:
+            # 高风险协议块：完整删除（包括内部内容）
+            cls._DANGEROUS_BLOCK_PATTERN = re.compile(
+                r'<\s*(invoke|tool_result)\b[^>]*>.*?</\s*\1\s*>',
+                re.IGNORECASE | re.DOTALL
+            )
+            # thinking 标签：保留内部内容，仅去除标签壳
+            cls._THINKING_TAG_PATTERN = re.compile(
+                r'<\s*thinking\b[^>]*>(.*?)</\s*thinking\s*>',
+                re.IGNORECASE | re.DOTALL
+            )
+            # 通用 XML 标签：去除标签壳
+            cls._GENERIC_XML_TAG_PATTERN = re.compile(
+                r'</?[a-zA-Z][a-zA-Z0-9_\-:]*[^>]*>'
+            )
+        return (
+            cls._DANGEROUS_BLOCK_PATTERN,
+            cls._THINKING_TAG_PATTERN,
+            cls._GENERIC_XML_TAG_PATTERN,
+        )
+
+    def _sanitize_protocol_tags(self, text: str) -> str:
+        """过滤潜在协议标签，防止用户通过伪造 XML 标签进行提示注入攻击。
+
+        处理策略：
+        1. <invoke>...</invoke>、<tool_result>...</tool_result>：整块删除
+        2. <thinking>...</thinking>：保留内部自然语言内容，仅移除标签
+        3. 其他 XML 样式标签：移除标签壳，保留内部文本
+
+        注意：此方法仅用于用户/系统侧输入文本，不应用于模型输出内容。
+        """
+        if not isinstance(text, str) or not text:
+            return text
+
+        dangerous_pattern, thinking_pattern, generic_pattern = self._get_sanitize_patterns()
+
+        # 1) 移除高风险协议块（包括内部内容）
+        cleaned = dangerous_pattern.sub('', text)
+
+        # 2) 去掉 <thinking> 标签外壳，保留内部自然语言内容
+        cleaned = thinking_pattern.sub(r'\1', cleaned)
+
+        # 3) 移除剩余的 XML 样式标签（仅标签本身，保留内部文本）
+        cleaned = generic_pattern.sub('', cleaned)
+
+        return cleaned
+
+    # ==================== Schema 清理方法 ====================
 
     def _sanitize_schema(self, schema: Dict[str, Any]) -> Dict[str, Any]:
         """递归移除Gemini不支持的JSON Schema关键字"""

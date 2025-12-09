@@ -378,7 +378,7 @@ async def dashboard(request: Request):
                         <div class="form-section" id="model-mapping-section">
                             <h4>模型映射</h4>
                             <p class="form-hint">当客户端请求某个模型时，可映射为渠道实际调用的模型。例如：将 <code>A1</code> 映射为 <code>B1</code>。可配置多条。</p>
-                            <div id="model-mapping-rows" class="form-row" style="grid-template-columns: 1fr 1fr auto; gap: 10px;">
+                            <div id="model-mapping-rows">
                                 <!-- 动态添加映射行 -->
                             </div>
                             <div class="form-actions" style="margin-top: 8px;">
@@ -396,7 +396,69 @@ async def dashboard(request: Request):
                     </div>
                 </div>
             </div>
-            
+
+            <!-- Gateway 配置区域 -->
+            <div class="channel-management">
+                <h2>Gateway 转发配置</h2>
+                <div class="channel-form">
+                    <div class="gateway-form-header">
+                        <h3>全局配置</h3>
+                        <span id="gatewayStatus" class="status-badge status-unconfigured">未配置</span>
+                    </div>
+                    <p class="form-hint" style="margin-bottom: 20px;">Gateway 允许用户使用自己的 API Key，通过 <code>/gateway/*</code> 端点访问，系统会自动进行格式转换后转发到目标服务。</p>
+                    <form id="gatewayForm">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="gateway_provider">目标提供商:</label>
+                                <select id="gateway_provider" name="provider" required>
+                                    <option value="">请选择</option>
+                                    <option value="openai">OpenAI</option>
+                                    <option value="anthropic">Anthropic</option>
+                                    <option value="gemini">Google Gemini</option>
+                                </select>
+                                <small class="form-hint">请求将被转换为此格式</small>
+                            </div>
+                            <div class="form-group">
+                                <label for="gateway_base_url">目标 Base URL:</label>
+                                <input type="url" id="gateway_base_url" name="base_url" placeholder="例如：https://api.openai.com/v1" required>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="gateway_timeout">超时时间(秒):</label>
+                                <input type="number" id="gateway_timeout" name="timeout" value="30" min="1" max="600">
+                            </div>
+                            <div class="form-group">
+                                <label for="gateway_max_retries">重试次数:</label>
+                                <input type="number" id="gateway_max_retries" name="max_retries" value="1" min="0" max="10">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group" style="grid-column: 1 / -1;">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="gateway_enabled" name="enabled" checked>
+                                    <span>启用 Gateway</span>
+                                </label>
+                            </div>
+                        </div>
+                        <div class="form-section" id="gateway-model-mapping-section">
+                            <h4>模型映射</h4>
+                            <p class="form-hint">用户请求中的模型名将被替换为目标模型名。例如：<code>claude-3-5-sonnet</code> → <code>gpt-4o</code></p>
+                            <div id="gateway-model-mapping-rows">
+                                <!-- 动态添加映射行 -->
+                            </div>
+                            <div class="form-actions" style="margin-top: 8px;">
+                                <button type="button" class="btn-secondary" onclick="addGatewayMappingRow()">新增映射</button>
+                            </div>
+                        </div>
+                        <div class="form-actions" style="margin-top: 20px;">
+                            <button type="submit" class="btn-primary">保存配置</button>
+                            <button type="button" class="btn-danger" onclick="deleteGatewayConfig()" id="deleteGatewayBtn" style="display: none;">删除配置</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+
             <!-- API使用说明区域 -->
             <div class="api-usage">
                 <h2>API使用说明</h2>

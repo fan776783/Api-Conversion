@@ -20,6 +20,9 @@ from src.utils.logger import (
 )
 from src.utils.exceptions import ChannelNotFoundError, ConversionError, APIError, TimeoutError
 from src.utils.http_client import get_http_client
+from src.core.gateway_config import (
+    GatewayConfig, load_gateway_config, save_gateway_config, delete_gateway_config
+)
 
 logger = setup_logger("conversion_api")
 
@@ -647,3 +650,81 @@ async def test_proxy_connection(request: ProxyTestRequest, _: bool = Depends(get
             "message": "代理测试过程中发生错误",
             "error": str(e)
         }
+
+
+# Gateway 配置管理 API
+class GatewayConfigRequest(BaseModel):
+    """Gateway 配置请求"""
+    provider: str = Field(..., description="目标提供商 (openai/anthropic/gemini)")
+    base_url: str = Field(..., description="目标 API 基础 URL")
+    timeout: int = Field(30, description="超时时间（秒）", ge=1, le=600)
+    max_retries: int = Field(1, description="最大重试次数", ge=0, le=10)
+    model_mapping: Optional[Dict[str, str]] = Field(default=None, description="模型映射")
+    enabled: bool = Field(True, description="是否启用 Gateway")
+
+
+class GatewayConfigResponse(BaseModel):
+    """Gateway 配置响应"""
+    success: bool
+    config: Optional[Dict[str, Any]] = None
+    message: Optional[str] = None
+
+
+@router.get("/gateway/config", response_model=GatewayConfigResponse)
+async def get_gateway_config(_: bool = Depends(get_session_user)):
+    """获取 Gateway 全局配置"""
+    config = load_gateway_config()
+    if not config:
+        return GatewayConfigResponse(
+            success=True,
+            config=None,
+            message="Gateway 未配置"
+        )
+    return GatewayConfigResponse(
+        success=True,
+        config=config.to_dict(),
+        message="OK"
+    )
+
+
+@router.put("/gateway/config", response_model=GatewayConfigResponse)
+async def upsert_gateway_config(
+    request: GatewayConfigRequest,
+    _: bool = Depends(get_session_user),
+):
+    """创建或更新 Gateway 全局配置"""
+    try:
+        config = GatewayConfig(
+            provider=request.provider,
+            base_url=request.base_url,
+            timeout=request.timeout,
+            max_retries=request.max_retries,
+            model_mapping=request.model_mapping or {},
+            enabled=request.enabled,
+        )
+        save_gateway_config(config)
+        return GatewayConfigResponse(
+            success=True,
+            config=config.to_dict(),
+            message="Gateway 配置已更新",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Failed to save gateway config: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save gateway config")
+
+
+@router.delete("/gateway/config", response_model=GatewayConfigResponse)
+async def clear_gateway_config(_: bool = Depends(get_session_user)):
+    """删除 Gateway 配置"""
+    try:
+        delete_gateway_config()
+        return GatewayConfigResponse(
+            success=True,
+            config=None,
+            message="Gateway 配置已删除",
+        )
+    except Exception as e:
+        logger.error(f"Failed to delete gateway config: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete gateway config")
