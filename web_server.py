@@ -32,6 +32,13 @@ def main():
 
     args = parser.parse_args()
 
+    # 检查调试模式：命令行参数或环境变量
+    debug_mode = args.debug or os.environ.get("DEBUG_CONVERTER", "").lower() in ("1", "true", "yes")
+    if debug_mode:
+        from src.utils.logger import enable_debug
+        enable_debug(True)
+        print("🔧 调试模式已启用 (DEBUG_CONVERTER)")
+
     # 验证配置
     config_errors = env_config.validate_config()
     if config_errors:

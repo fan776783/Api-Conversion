@@ -16,6 +16,33 @@ from typing import Any, Dict, Mapping, Optional
 # 全局日志器缓存，避免重复创建
 _loggers = {}
 
+# 全局调试模式开关
+_debug_mode = False
+
+
+def is_debug_enabled() -> bool:
+    """检查是否启用调试模式"""
+    return _debug_mode
+
+
+def enable_debug(enabled: bool = True):
+    """
+    启用或禁用调试模式。
+    调试模式下，所有 logger 的级别会被设置为 DEBUG。
+
+    Args:
+        enabled: True 启用调试模式，False 禁用
+    """
+    global _debug_mode
+    _debug_mode = enabled
+
+    # 更新所有已创建的 logger 的级别
+    target_level = logging.DEBUG if enabled else logging.INFO
+    for logger in _loggers.values():
+        logger.setLevel(target_level)
+        for handler in logger.handlers:
+            handler.setLevel(target_level)
+
 
 def setup_logger(name: str, level: str = None) -> logging.Logger:
     """设置日志器"""

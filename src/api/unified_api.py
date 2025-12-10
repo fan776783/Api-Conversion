@@ -4,6 +4,7 @@
 """
 import json
 import time
+import logging
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 from urllib.parse import urlencode, parse_qsl
@@ -2072,6 +2073,9 @@ async def gateway_proxy(full_path: str, request: Request):
                 request_data["stream"] = True
     original_model = request_data.get("model")
 
+    # 简洁的请求信息日志
+    logger.info(f"📨 Gateway request: model={original_model}, format={source_format}->{config.provider}, streaming={is_streaming}")
+
     # 6. 记录请求日志
     log_request_entry(
         logger,
@@ -2116,35 +2120,36 @@ async def gateway_proxy(full_path: str, request: Request):
             logger.info(f"Gateway model mapping: {original_model} -> {mapped}")
             converted_data["model"] = mapped
 
-    # DEBUG: 打印转换后的完整请求 (使用 print 确保显示)
-    print(f"🔴🔴🔴 [DEBUG] converted_data keys: {list(converted_data.keys()) if isinstance(converted_data, dict) else 'not dict'}")
-    if isinstance(converted_data, dict) and "tools" in converted_data:
-        print(f"🔴🔴🔴 [DEBUG] tools: {json.dumps(converted_data['tools'], ensure_ascii=False, default=str)[:5000]}")
-    if isinstance(converted_data, dict) and "messages" in converted_data:
-        # 打印消息摘要：每条消息的 role 和内容前100字符
-        msgs_summary = []
-        for i, msg in enumerate(converted_data.get("messages", [])):
-            role = msg.get("role", "?")
-            content = msg.get("content", "")
-            tool_call_id = msg.get("tool_call_id", "")
-            tool_calls = msg.get("tool_calls", [])
-            summary = f"[{i}] {role}"
-            if tool_call_id:
-                summary += f" tool_call_id={tool_call_id}"
-            if tool_calls:
-                summary += f" tool_calls={[tc.get('id') for tc in tool_calls]}"
-            if content:
-                summary += f" content={str(content)[:80]}..."
-            msgs_summary.append(summary)
-        print(f"🔴🔴🔴 [DEBUG] messages ({len(converted_data['messages'])}): " + " | ".join(msgs_summary))
+    # DEBUG: 打印转换后的完整请求 (仅在调试模式下)
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"🔴 [DEBUG] converted_data keys: {list(converted_data.keys()) if isinstance(converted_data, dict) else 'not dict'}")
+        if isinstance(converted_data, dict) and "tools" in converted_data:
+            logger.debug(f"🔴 [DEBUG] tools: {json.dumps(converted_data['tools'], ensure_ascii=False, default=str)[:5000]}")
+        if isinstance(converted_data, dict) and "messages" in converted_data:
+            # 打印消息摘要：每条消息的 role 和内容前100字符
+            msgs_summary = []
+            for i, msg in enumerate(converted_data.get("messages", [])):
+                role = msg.get("role", "?")
+                content = msg.get("content", "")
+                tool_call_id = msg.get("tool_call_id", "")
+                tool_calls = msg.get("tool_calls", [])
+                summary = f"[{i}] {role}"
+                if tool_call_id:
+                    summary += f" tool_call_id={tool_call_id}"
+                if tool_calls:
+                    summary += f" tool_calls={[tc.get('id') for tc in tool_calls]}"
+                if content:
+                    summary += f" content={str(content)[:80]}..."
+                msgs_summary.append(summary)
+            logger.debug(f"🔴 [DEBUG] messages ({len(converted_data['messages'])}): " + " | ".join(msgs_summary))
 
-    # DEBUG: 将完整请求体写入临时文件以便分析
-    import tempfile
-    import os
-    debug_file = os.path.join(tempfile.gettempdir(), "gateway_converted_request.json")
-    with open(debug_file, "w", encoding="utf-8") as f:
-        f.write(json.dumps(converted_data, ensure_ascii=False, indent=2, default=str))
-    print(f"🔴🔴🔴 [DEBUG] Full converted request written to: {debug_file}")
+        # DEBUG: 将完整请求体写入临时文件以便分析
+        import tempfile
+        import os as _os
+        debug_file = _os.path.join(tempfile.gettempdir(), "gateway_converted_request.json")
+        with open(debug_file, "w", encoding="utf-8") as f:
+            f.write(json.dumps(converted_data, ensure_ascii=False, indent=2, default=str))
+        logger.debug(f"🔴 [DEBUG] Full converted request written to: {debug_file}")
 
     # 9. 构造目标 URL（基于目标 provider，而非源格式路径）
     base = config.base_url.rstrip("/")

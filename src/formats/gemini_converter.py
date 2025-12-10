@@ -3,6 +3,9 @@ Gemini格式转换器
 处理Google Gemini API格式与其他格式之间的转换
 """
 from typing import Dict, Any, Optional, List
+from time import monotonic
+from collections import OrderedDict
+from threading import Lock
 import json
 import copy
 
@@ -12,6 +15,10 @@ from .base_converter import BaseConverter, ConversionResult, ConversionError
 class GeminiConverter(BaseConverter):
     """Gemini格式转换器"""
 
+    # Cache configuration for reasoning_details
+    _CACHE_TTL_SECONDS = 3600  # 1 hour TTL
+    _CACHE_MAX_SIZE = 1000     # Max entries to prevent unbounded growth
+
     def __init__(self):
         super().__init__()
         self.original_model = None
@@ -19,13 +26,58 @@ class GeminiConverter(BaseConverter):
         # key: tool_call_id, value: thoughtSignature
         self._thought_signatures_by_tool_call_id: Dict[str, str] = {}
         # 用于保留 OpenRouter reasoning_details（按 assistant 消息的首个 tool_call_id 索引）
-        # key: first_tool_call_id, value: reasoning_details array
-        # 多轮工具调用时，每个 assistant 消息的 reasoning_details 都需要保留
-        self._reasoning_details_cache: Dict[str, List[Dict[str, Any]]] = {}
+        # key: first_tool_call_id, value: {"data": reasoning_details, "ts": monotonic timestamp}
+        # 使用 OrderedDict 实现 LRU 淘汰策略
+        self._reasoning_details_cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+        self._cache_lock = Lock()
     
     def set_original_model(self, model: str):
         """设置原始模型名称"""
         self.original_model = model
+
+    # ========== reasoning_details cache methods (TTL + LRU) ==========
+
+    def _cache_reasoning_details(self, tool_call_id: str, details: List[Dict[str, Any]]):
+        """Store reasoning_details with TTL and LRU eviction"""
+        with self._cache_lock:
+            self._cleanup_stale_cache_locked()
+            # Evict oldest entries if at capacity (guard against invalid config)
+            if self._CACHE_MAX_SIZE > 0:
+                while len(self._reasoning_details_cache) >= self._CACHE_MAX_SIZE:
+                    evicted_key, _ = self._reasoning_details_cache.popitem(last=False)
+                    self.logger.debug(f"[CACHE] LRU evicted: {evicted_key}, remaining={len(self._reasoning_details_cache)}")
+            # Store with monotonic timestamp
+            self._reasoning_details_cache[tool_call_id] = {
+                "data": details,
+                "ts": monotonic()
+            }
+            # Move to end (most recently used)
+            self._reasoning_details_cache.move_to_end(tool_call_id)
+
+    def _get_cached_reasoning_details(self, tool_call_id: str) -> Optional[List[Dict[str, Any]]]:
+        """Retrieve cached reasoning_details, return None if expired or not found"""
+        with self._cache_lock:
+            entry = self._reasoning_details_cache.get(tool_call_id)
+            if not entry:
+                return None
+            # Check TTL
+            if monotonic() - entry["ts"] > self._CACHE_TTL_SECONDS:
+                self._reasoning_details_cache.pop(tool_call_id, None)
+                return None
+            # Move to end on access (LRU)
+            self._reasoning_details_cache.move_to_end(tool_call_id)
+            return entry["data"]
+
+    def _cleanup_stale_cache_locked(self):
+        """Remove expired entries (must be called with lock held)"""
+        now = monotonic()
+        stale_keys = [
+            k for k, v in self._reasoning_details_cache.items()
+            if now - v["ts"] > self._CACHE_TTL_SECONDS
+        ]
+        for k in stale_keys:
+            self._reasoning_details_cache.pop(k, None)
+            self.logger.debug(f"[CACHE] TTL expired: {k}, remaining={len(self._reasoning_details_cache)}")
     
     def _determine_reasoning_effort_from_budget(self, thinking_budget: Optional[int]) -> str:
         """根据thinkingBudget判断OpenAI reasoning_effort等级
@@ -78,7 +130,7 @@ class GeminiConverter(BaseConverter):
         """重置所有流式相关的状态变量，避免状态污染"""
         streaming_attrs = [
             '_anthropic_stream_id', '_openai_sent_start', '_gemini_text_started',
-            '_anthropic_to_gemini_state', '_streaming_tool_calls'
+            '_anthropic_to_gemini_state', '_streaming_tool_calls', '_streaming_reasoning_details'
         ]
         for attr in streaming_attrs:
             if hasattr(self, attr):
@@ -86,6 +138,7 @@ class GeminiConverter(BaseConverter):
         # 清空 thoughtSignature 映射
         self._thought_signatures_by_tool_call_id.clear()
         # 注意：不清空 _reasoning_details_cache，因为它需要跨请求保留以支持多轮工具调用
+        # TTL + LRU 机制会自动清理过期和超容量的条目
     
     def get_supported_formats(self) -> List[str]:
         """获取支持的格式列表"""
@@ -168,7 +221,7 @@ class GeminiConverter(BaseConverter):
 
         # 🔍 调试日志：记录收到的 contents 结构
         contents = data.get("contents", [])
-        print(f"📥 [GEMINI->OPENAI] Received {len(contents)} content items")
+        self.logger.debug(f"📥 [GEMINI->OPENAI] Received {len(contents)} content items")
         for idx, content in enumerate(contents):
             role = content.get("role", "user")
             parts = content.get("parts", [])
@@ -179,7 +232,7 @@ class GeminiConverter(BaseConverter):
                     fr_id = part["functionResponse"].get("id", "NO_ID")
                     fr_ids.append(fr_id)
             if fr_ids:
-                print(f"📥 [GEMINI->OPENAI] Content[{idx}] role={role}, functionResponse IDs: {fr_ids}")
+                self.logger.debug(f"📥 [GEMINI->OPENAI] Content[{idx}] role={role}, functionResponse IDs: {fr_ids}")
 
         # 添加系统消息 - 支持两种格式
         system_instruction_data = data.get("systemInstruction") or data.get("system_instruction")
@@ -232,10 +285,10 @@ class GeminiConverter(BaseConverter):
 
                                 # 去重：跳过已处理的 functionResponse（基于 tool_call_id）
                                 if tool_call_id in _processed_function_response_ids:
-                                    print(f"🔄 [GEMINI->OPENAI] Skipping duplicate functionResponse: {tool_call_id}")
+                                    self.logger.debug(f"🔄 [GEMINI->OPENAI] Skipping duplicate functionResponse: {tool_call_id}")
                                     continue
                                 _processed_function_response_ids.add(tool_call_id)
-                                print(f"✅ [GEMINI->OPENAI] Processing functionResponse: {tool_call_id}")
+                                self.logger.debug(f"✅ [GEMINI->OPENAI] Processing functionResponse: {tool_call_id}")
 
                                 # 某些 OpenAI 兼容 API 要求 tool 消息包含 name 字段
                                 tool_msg = {
@@ -271,9 +324,11 @@ class GeminiConverter(BaseConverter):
                         # 从 cache 中查找对应的 reasoning_details（按首个 tool_call_id 索引）
                         if tool_calls:
                             first_tool_call_id = tool_calls[0].get("id")
-                            if first_tool_call_id and first_tool_call_id in self._reasoning_details_cache:
-                                message["reasoning_details"] = self._reasoning_details_cache[first_tool_call_id]
-                                print(f"🧠 [REASONING_DETAILS] Attached {len(message['reasoning_details'])} reasoning_details to assistant message (key={first_tool_call_id})")
+                            if first_tool_call_id:
+                                cached_details = self._get_cached_reasoning_details(first_tool_call_id)
+                                if cached_details:
+                                    message["reasoning_details"] = cached_details
+                                    self.logger.debug(f"🧠 [REASONING_DETAILS] Attached {len(cached_details)} reasoning_details to assistant message (key={first_tool_call_id})")
                         messages.append(message)
                     else:
                         # 普通助手消息（无工具调用）
@@ -313,10 +368,10 @@ class GeminiConverter(BaseConverter):
 
                             # 去重：跳过已处理的 functionResponse（基于 tool_call_id）
                             if tool_call_id in _processed_function_response_ids:
-                                print(f"🔄 [GEMINI->OPENAI] Skipping duplicate functionResponse (tool role): {tool_call_id}")
+                                self.logger.debug(f"🔄 [GEMINI->OPENAI] Skipping duplicate functionResponse (tool role): {tool_call_id}")
                                 continue
                             _processed_function_response_ids.add(tool_call_id)
-                            print(f"✅ [GEMINI->OPENAI] Processing functionResponse (tool role): {tool_call_id}")
+                            self.logger.debug(f"✅ [GEMINI->OPENAI] Processing functionResponse (tool role): {tool_call_id}")
 
                             # 某些 OpenAI 兼容 API 要求 tool 消息包含 name 字段
                             tool_msg = {
@@ -342,10 +397,10 @@ class GeminiConverter(BaseConverter):
         # 🔍 调试日志：记录转换后的 messages 结构
         tool_msgs = [m for m in messages if m.get("role") == "tool"]
         tool_call_ids = [m.get("tool_call_id") for m in tool_msgs]
-        print(f"📤 [GEMINI->OPENAI] Generated {len(messages)} messages, {len(tool_msgs)} tool messages")
+        self.logger.debug(f"📤 [GEMINI->OPENAI] Generated {len(messages)} messages, {len(tool_msgs)} tool messages")
         if tool_call_ids:
-            print(f"📤 [GEMINI->OPENAI] Tool message IDs: {tool_call_ids}")
-        print(f"📤 [GEMINI->OPENAI] Dedup stats: processed {len(_processed_function_response_ids)} unique functionResponse IDs")
+            self.logger.debug(f"📤 [GEMINI->OPENAI] Tool message IDs: {tool_call_ids}")
+        self.logger.debug(f"📤 [GEMINI->OPENAI] Dedup stats: processed {len(_processed_function_response_ids)} unique functionResponse IDs")
 
         result_data["messages"] = messages
 
@@ -554,7 +609,7 @@ class GeminiConverter(BaseConverter):
 
         # 汇总 thoughtSignature 捕获情况
         if self._thought_signatures_by_tool_call_id:
-            print(f"🧠 [THOUGHT_SIGNATURE] Request conversion complete. Captured {len(self._thought_signatures_by_tool_call_id)} signatures: {list(self._thought_signatures_by_tool_call_id.keys())}")
+            self.logger.debug(f"🧠 [THOUGHT_SIGNATURE] Request conversion complete. Captured {len(self._thought_signatures_by_tool_call_id)} signatures: {list(self._thought_signatures_by_tool_call_id.keys())}")
 
         return ConversionResult(success=True, data=result_data)
     
@@ -777,8 +832,8 @@ class GeminiConverter(BaseConverter):
             if reasoning_details and tool_calls:
                 first_tool_call_id = tool_calls[0].get("id") if tool_calls else None
                 if first_tool_call_id:
-                    self._reasoning_details_cache[first_tool_call_id] = reasoning_details
-                    print(f"🧠 [REASONING_DETAILS] Cached {len(reasoning_details)} reasoning_details (key={first_tool_call_id})")
+                    self._cache_reasoning_details(first_tool_call_id, reasoning_details)
+                    self.logger.debug(f"🧠 [REASONING_DETAILS] Cached {len(reasoning_details)} reasoning_details (key={first_tool_call_id})")
 
             # 构建 parts
             parts = []
@@ -817,7 +872,7 @@ class GeminiConverter(BaseConverter):
                         if tool_call_id and tool_call_id in self._thought_signatures_by_tool_call_id:
                             thought_signature = self._thought_signatures_by_tool_call_id[tool_call_id]
                             part["thoughtSignature"] = thought_signature
-                            print(f"🧠 [THOUGHT_SIGNATURE] Restored: tool_call_id={tool_call_id}, signature={thought_signature[:50]}...")
+                            self.logger.debug(f"🧠 [THOUGHT_SIGNATURE] Restored: tool_call_id={tool_call_id}, signature={thought_signature[:50]}...")
 
                         parts.append(part)
             
@@ -894,7 +949,7 @@ class GeminiConverter(BaseConverter):
                     if tool_use_id and tool_use_id in self._thought_signatures_by_tool_call_id:
                         thought_signature = self._thought_signatures_by_tool_call_id[tool_use_id]
                         part["thoughtSignature"] = thought_signature
-                        print(f"🧠 [THOUGHT_SIGNATURE] Restored (Anthropic): tool_use_id={tool_use_id}, signature={thought_signature[:50]}...")
+                        self.logger.debug(f"🧠 [THOUGHT_SIGNATURE] Restored (Anthropic): tool_use_id={tool_use_id}, signature={thought_signature[:50]}...")
 
                     parts.append(part)
         
@@ -946,7 +1001,7 @@ class GeminiConverter(BaseConverter):
             reasoning_details = delta.get("reasoning_details") or choice.get("message", {}).get("reasoning_details")
             if reasoning_details:
                 self._streaming_reasoning_details = reasoning_details
-                print(f"🧠 [REASONING_DETAILS] Captured {len(reasoning_details)} reasoning_details from streaming chunk")
+                self.logger.debug(f"🧠 [REASONING_DETAILS] Captured {len(reasoning_details)} reasoning_details from streaming chunk")
 
         # 先处理增量内容和工具调用（收集状态）
         if "choices" in data and data["choices"] and data["choices"][0]:
@@ -1004,8 +1059,8 @@ class GeminiConverter(BaseConverter):
                     first_index = min(self._streaming_tool_calls.keys())
                     first_tool_call_id = self._streaming_tool_calls[first_index].get("id")
                     if first_tool_call_id:
-                        self._reasoning_details_cache[first_tool_call_id] = self._streaming_reasoning_details
-                        print(f"🧠 [REASONING_DETAILS] Cached {len(self._streaming_reasoning_details)} reasoning_details from streaming (key={first_tool_call_id})")
+                        self._cache_reasoning_details(first_tool_call_id, self._streaming_reasoning_details)
+                        self.logger.debug(f"🧠 [REASONING_DETAILS] Cached {len(self._streaming_reasoning_details)} reasoning_details from streaming (key={first_tool_call_id})")
                     self._streaming_reasoning_details = None
 
                 for call_index, tool_call in self._streaming_tool_calls.items():
@@ -1041,7 +1096,7 @@ class GeminiConverter(BaseConverter):
                     if tool_call_id and tool_call_id in self._thought_signatures_by_tool_call_id:
                         thought_signature = self._thought_signatures_by_tool_call_id[tool_call_id]
                         part["thoughtSignature"] = thought_signature
-                        print(f"🧠 [THOUGHT_SIGNATURE] Restored (streaming): tool_call_id={tool_call_id}, signature={thought_signature[:50]}...")
+                        self.logger.debug(f"🧠 [THOUGHT_SIGNATURE] Restored (streaming): tool_call_id={tool_call_id}, signature={thought_signature[:50]}...")
 
                     parts.append(part)
                 
@@ -1159,7 +1214,7 @@ class GeminiConverter(BaseConverter):
                         if tool_use_id and tool_use_id in self._thought_signatures_by_tool_call_id:
                             thought_signature = self._thought_signatures_by_tool_call_id[tool_use_id]
                             part["thoughtSignature"] = thought_signature
-                            print(f"🧠 [THOUGHT_SIGNATURE] Restored (Anthropic streaming): tool_use_id={tool_use_id}, signature={thought_signature[:50]}...")
+                            self.logger.debug(f"🧠 [THOUGHT_SIGNATURE] Restored (Anthropic streaming): tool_use_id={tool_use_id}, signature={thought_signature[:50]}...")
 
                         parts.append(part)
                     except json.JSONDecodeError:
@@ -1177,7 +1232,7 @@ class GeminiConverter(BaseConverter):
                         if tool_use_id and tool_use_id in self._thought_signatures_by_tool_call_id:
                             thought_signature = self._thought_signatures_by_tool_call_id[tool_use_id]
                             part_err["thoughtSignature"] = thought_signature
-                            print(f"🧠 [THOUGHT_SIGNATURE] Restored (Anthropic streaming, decode error): tool_use_id={tool_use_id}, signature={thought_signature[:50]}...")
+                            self.logger.debug(f"🧠 [THOUGHT_SIGNATURE] Restored (Anthropic streaming, decode error): tool_use_id={tool_use_id}, signature={thought_signature[:50]}...")
 
                         parts.append(part_err)
             
@@ -1448,7 +1503,7 @@ class GeminiConverter(BaseConverter):
                 thought_signature = part.get("thoughtSignature")
                 if thought_signature:
                     self._thought_signatures_by_tool_call_id[tool_call_id] = thought_signature
-                    print(f"🧠 [THOUGHT_SIGNATURE] Captured: tool_call_id={tool_call_id}, signature={thought_signature[:50]}...")
+                    self.logger.debug(f"🧠 [THOUGHT_SIGNATURE] Captured: tool_call_id={tool_call_id}, signature={thought_signature[:50]}...")
 
                 tool_calls.append({
                     "id": tool_call_id,

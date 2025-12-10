@@ -12,6 +12,10 @@
 8. [错误处理](#错误处理)
 9. [配置项说明](#配置项说明)
 10. [完整示例](#完整示例)
+11. [多轮工具调用状态保留](#多轮工具调用状态保留)
+    - [thoughtSignature 处理逻辑](#thoughtsignature-处理逻辑)
+    - [reasoning_details 处理逻辑](#reasoning_details-处理逻辑)
+12. [总结](#总结)
 
 ---
 
@@ -1263,6 +1267,335 @@ if channel.models_mapping and isinstance(request_data, dict):
 
 ---
 
+## 多轮工具调用状态保留
+
+### 概述
+
+当使用 OpenRouter 等第三方 API 代理调用 Gemini 3 Pro 等推理模型进行多轮工具调用时，需要保留两个关键字段：
+
+1. **`thoughtSignature`**：Gemini 原生的思考签名，用于验证工具调用的推理过程
+2. **`reasoning_details`**：OpenRouter 特有的推理详情，用于在多轮对话中保持推理上下文
+
+如果不正确保留这些字段，多轮工具调用会返回 400 错误：
+- `"Function call is missing a thought_signature in functionCall parts"`
+- `"Gemini models require OpenRouter reasoning details to be preserved in each request"`
+
+### thoughtSignature 处理逻辑
+
+#### 背景
+
+`thoughtSignature` 是 Google Gemini API 在使用推理模型（如 Gemini 2.5 Flash/Pro）进行工具调用时返回的签名字段。它位于响应的 `functionCall` 同级位置，用于验证推理过程的完整性。
+
+**参考文档**: https://ai.google.dev/gemini-api/docs/thought-signatures
+
+#### 数据结构
+
+```python
+# GeminiConverter.__init__
+self._thought_signatures_by_tool_call_id: Dict[str, str] = {}
+# key: tool_call_id (如 "call_get_weather_0001")
+# value: thoughtSignature 字符串
+```
+
+#### 捕获流程
+
+在 Gemini → OpenAI 请求转换时，从 `functionCall` 同级提取 `thoughtSignature`：
+
+```python
+# _convert_content_from_gemini 方法
+elif "functionCall" in part:
+    fc = part["functionCall"]
+    tool_call_id = fc.get("id") or f"call_{func_name}_{sequence:04d}"
+
+    # 提取并保存 thoughtSignature
+    thought_signature = part.get("thoughtSignature")
+    if thought_signature:
+        self._thought_signatures_by_tool_call_id[tool_call_id] = thought_signature
+        print(f"🧠 [THOUGHT_SIGNATURE] Captured: tool_call_id={tool_call_id}")
+```
+
+**Gemini 响应格式**（包含 thoughtSignature）：
+```json
+{
+    "candidates": [{
+        "content": {
+            "parts": [{
+                "functionCall": {
+                    "name": "get_weather",
+                    "args": {"location": "Beijing"},
+                    "id": "call_xyz"
+                },
+                "thoughtSignature": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9..."
+            }],
+            "role": "model"
+        }
+    }]
+}
+```
+
+#### 回填流程
+
+在 OpenAI → Gemini 响应转换时，将缓存的 `thoughtSignature` 回填到 `functionCall` 同级：
+
+```python
+# _convert_from_openai_response 方法
+part: Dict[str, Any] = {"functionCall": function_call}
+
+# 回填 thoughtSignature
+if tool_call_id and tool_call_id in self._thought_signatures_by_tool_call_id:
+    thought_signature = self._thought_signatures_by_tool_call_id[tool_call_id]
+    part["thoughtSignature"] = thought_signature
+    print(f"🧠 [THOUGHT_SIGNATURE] Restored: tool_call_id={tool_call_id}")
+
+parts.append(part)
+```
+
+#### 回填位置
+
+| 转换方法 | 说明 |
+|---------|------|
+| `_convert_from_openai_response` | 非流式 OpenAI 响应 → Gemini |
+| `_convert_from_openai_streaming_chunk` | 流式 OpenAI 响应 → Gemini |
+| `_convert_from_anthropic_response` | 非流式 Anthropic 响应 → Gemini |
+| `_convert_from_anthropic_streaming_chunk` | 流式 Anthropic 响应 → Gemini |
+
+#### 生命周期
+
+- **创建**: 每次请求转换开始时清空 (`_convert_to_openai_request`)
+- **保留**: 在同一请求的响应转换中使用
+- **清理**: 下一次请求转换开始时清空
+
+---
+
+### reasoning_details 处理逻辑
+
+#### 背景
+
+`reasoning_details` 是 OpenRouter 在调用推理模型时返回的推理详情数组。它包含模型的思考过程、加密的推理链等信息。**在多轮工具调用中，必须将 `reasoning_details` 原样回传到后续请求的 assistant 消息中**。
+
+**参考文档**: https://openrouter.ai/docs/guides/best-practices/reasoning-tokens
+
+#### 数据结构
+
+```python
+# GeminiConverter 类属性（缓存配置）
+_CACHE_TTL_SECONDS = 3600  # 1 小时 TTL
+_CACHE_MAX_SIZE = 1000     # 最大条目数
+
+# GeminiConverter.__init__
+self._reasoning_details_cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+# key: 首个 tool_call_id (如 "call_get_weather_0001")
+# value: {"data": reasoning_details 数组, "ts": monotonic 时间戳}
+self._cache_lock = Lock()  # 线程安全锁
+```
+
+**关键设计**:
+- 使用首个 `tool_call_id` 作为索引，因为每个包含工具调用的 assistant 消息都有唯一的首个 tool_call_id
+- 使用 `OrderedDict` 实现 LRU 淘汰策略
+- 使用 `monotonic()` 时间戳避免系统时钟回拨影响
+
+#### reasoning_details 结构
+
+OpenRouter 返回的 `reasoning_details` 是一个数组，包含多种类型的推理块：
+
+```json
+{
+    "choices": [{
+        "message": {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [...],
+            "reasoning_details": [
+                {
+                    "type": "reasoning.summary",
+                    "summary": "分析问题并确定需要调用天气工具",
+                    "format": "anthropic-claude-v1",
+                    "index": 0
+                },
+                {
+                    "type": "reasoning.encrypted",
+                    "data": "eyJlbmNyeXB0ZWQiOiJ0cnVlIn0=",
+                    "format": "anthropic-claude-v1",
+                    "index": 1
+                },
+                {
+                    "type": "reasoning.text",
+                    "text": "让我一步步思考这个问题...",
+                    "signature": "sha256:abc123...",
+                    "format": "anthropic-claude-v1",
+                    "index": 2
+                }
+            ]
+        }
+    }]
+}
+```
+
+#### 缓存流程
+
+在 OpenAI → Gemini 响应转换时，捕获 `reasoning_details` 并存入缓存：
+
+**非流式响应** (`_convert_from_openai_response`):
+```python
+reasoning_details = message.get("reasoning_details")
+if reasoning_details and tool_calls:
+    first_tool_call_id = tool_calls[0].get("id")
+    if first_tool_call_id:
+        self._cache_reasoning_details(first_tool_call_id, reasoning_details)  # 使用缓存方法
+        print(f"🧠 [REASONING_DETAILS] Cached {len(reasoning_details)} items (key={first_tool_call_id})")
+```
+
+**流式响应** (`_convert_from_openai_streaming_chunk`):
+```python
+# 临时存储
+reasoning_details = delta.get("reasoning_details")
+if reasoning_details:
+    self._streaming_reasoning_details = reasoning_details
+
+# 流式结束时存入 cache
+if self._streaming_tool_calls and self._streaming_reasoning_details:
+    first_index = min(self._streaming_tool_calls.keys())
+    first_tool_call_id = self._streaming_tool_calls[first_index].get("id")
+    if first_tool_call_id:
+        self._cache_reasoning_details(first_tool_call_id, self._streaming_reasoning_details)  # 使用缓存方法
+```
+
+#### 回传流程
+
+在 Gemini → OpenAI 请求转换时，为每个包含工具调用的 assistant 消息附加对应的 `reasoning_details`：
+
+```python
+# _convert_to_openai_request 方法，处理 model 角色消息
+elif gemini_role == "model":
+    message_content = self._convert_content_from_gemini(parts)
+
+    if isinstance(message_content, dict) and message_content.get("type") == "tool_calls":
+        tool_calls = message_content["tool_calls"]
+        message = {
+            "role": "assistant",
+            "content": tool_call_content,
+            "tool_calls": tool_calls
+        }
+
+        # 从 cache 中查找对应的 reasoning_details（使用 TTL 验证）
+        if tool_calls:
+            first_tool_call_id = tool_calls[0].get("id")
+            if first_tool_call_id:
+                cached_details = self._get_cached_reasoning_details(first_tool_call_id)  # TTL + LRU
+                if cached_details:
+                    message["reasoning_details"] = cached_details
+                    print(f"🧠 [REASONING_DETAILS] Attached to assistant message (key={first_tool_call_id})")
+
+        messages.append(message)
+```
+
+#### 生命周期与清理机制
+
+- **创建**: 响应转换时通过 `_cache_reasoning_details()` 存入缓存
+- **保留**: **跨请求保留**（不在 `reset_streaming_state` 中清空）
+- **使用**: 请求转换时通过 `_get_cached_reasoning_details()` 附加到对应的 assistant 消息
+- **自动清理**: TTL + LRU 机制自动清理过期和超容量条目
+
+#### 缓存清理机制（TTL + LRU）
+
+为防止长生命周期实例的内存泄漏，`_reasoning_details_cache` 实现了自动清理机制：
+
+| 机制 | 说明 |
+|------|------|
+| **TTL 过期** | 条目超过 1 小时（`_CACHE_TTL_SECONDS`）自动失效 |
+| **LRU 淘汰** | 超过 1000 条（`_CACHE_MAX_SIZE`）时淘汰最旧条目 |
+| **线程安全** | 所有缓存操作使用 `threading.Lock` 保护 |
+| **时钟安全** | 使用 `time.monotonic()` 避免系统时钟回拨 |
+
+**缓存辅助方法**:
+
+```python
+def _cache_reasoning_details(self, tool_call_id: str, details: List[Dict[str, Any]]):
+    """存储 reasoning_details，带 TTL 和 LRU 淘汰"""
+    with self._cache_lock:
+        self._cleanup_stale_cache_locked()  # 清理过期条目
+        # 容量淘汰
+        if self._CACHE_MAX_SIZE > 0:
+            while len(self._reasoning_details_cache) >= self._CACHE_MAX_SIZE:
+                evicted_key, _ = self._reasoning_details_cache.popitem(last=False)
+                self.logger.debug(f"[CACHE] LRU evicted: {evicted_key}")
+        # 存储
+        self._reasoning_details_cache[tool_call_id] = {"data": details, "ts": monotonic()}
+        self._reasoning_details_cache.move_to_end(tool_call_id)
+
+def _get_cached_reasoning_details(self, tool_call_id: str) -> Optional[List[Dict[str, Any]]]:
+    """获取缓存的 reasoning_details，过期返回 None"""
+    with self._cache_lock:
+        entry = self._reasoning_details_cache.get(tool_call_id)
+        if not entry:
+            return None
+        if monotonic() - entry["ts"] > self._CACHE_TTL_SECONDS:
+            self._reasoning_details_cache.pop(tool_call_id, None)
+            self.logger.debug(f"[CACHE] TTL expired: {tool_call_id}")
+            return None
+        self._reasoning_details_cache.move_to_end(tool_call_id)  # LRU
+        return entry["data"]
+```
+
+**设计决策**:
+- `reset_streaming_state()` **不清空**缓存，因为需要跨请求保留以支持多轮工具调用
+- 依赖 TTL + LRU 自动清理，避免内存泄漏同时保证功能正确性
+
+#### 多轮工具调用示例
+
+**第一轮**:
+```
+请求: 用户询问天气
+响应: assistant 调用 get_weather 工具 (tool_call_id: call_001)
+      返回 reasoning_details_1
+缓存: {"call_001": reasoning_details_1}
+```
+
+**第二轮**:
+```
+请求: 包含 functionResponse
+      assistant 消息需要附加 reasoning_details_1 (通过 call_001 查找)
+响应: assistant 回复结果或调用另一个工具 (tool_call_id: call_002)
+      返回 reasoning_details_2
+缓存: {"call_001": reasoning_details_1, "call_002": reasoning_details_2}
+```
+
+**第三轮**:
+```
+请求: 包含多个历史 assistant 消息
+      第一个 assistant 消息附加 reasoning_details_1 (key: call_001)
+      第二个 assistant 消息附加 reasoning_details_2 (key: call_002)
+响应: ...
+```
+
+### 调试日志
+
+| 日志前缀 | 说明 |
+|---------|------|
+| `🧠 [THOUGHT_SIGNATURE] Captured` | 捕获 thoughtSignature |
+| `🧠 [THOUGHT_SIGNATURE] Restored` | 回填 thoughtSignature |
+| `🧠 [REASONING_DETAILS] Cached` | 缓存 reasoning_details |
+| `🧠 [REASONING_DETAILS] Attached` | 附加 reasoning_details 到请求 |
+| `[CACHE] LRU evicted` | 缓存容量淘汰（DEBUG 级别）|
+| `[CACHE] TTL expired` | 缓存 TTL 过期（DEBUG 级别）|
+
+### 常见错误及解决方案
+
+| 错误信息 | 原因 | 解决方案 |
+|---------|------|---------|
+| `Function call is missing a thought_signature` | thoughtSignature 未正确回传 | 检查 Gemini 请求中 functionCall 同级是否有 thoughtSignature |
+| `Gemini models require OpenRouter reasoning details to be preserved` | reasoning_details 未正确回传 | 检查 assistant 消息是否包含 reasoning_details 字段 |
+| `400 INVALID_ARGUMENT` | 多种原因 | 检查调试日志，确认捕获和回传日志都有输出 |
+
+### 参考资料
+
+- [Google Gemini Thought Signatures](https://ai.google.dev/gemini-api/docs/thought-signatures)
+- [OpenRouter Reasoning Tokens](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens)
+- [Vercel Community: Gemini 3 Pro 400 Error](https://community.vercel.com/t/gemini-3-pro-returns-400-invalid-argument-in-vercel-ai-sdk/28040)
+- [Open WebUI Issue #19328](https://github.com/open-webui/open-webui/issues/19328)
+
+---
+
 ## 总结
 
 Gemini 到 OpenAI 的格式转换涉及以下核心点：
@@ -1275,3 +1608,6 @@ Gemini 到 OpenAI 的格式转换涉及以下核心点：
 6. **工具调用 ID**：需要预扫描生成一致的 ID 映射
 7. **思考模式**：`thinkingBudget` 根据阈值映射为 `reasoning_effort` 等级
 8. **流式响应**：需要累积工具调用参数，在结束时一次性输出完整的 functionCall
+9. **多轮工具调用状态保留**：
+   - **thoughtSignature**：Gemini 推理模型的思考签名，需要在请求-响应往返中保留
+   - **reasoning_details**：OpenRouter 推理详情，需要跨请求保留并附加到对应的 assistant 消息

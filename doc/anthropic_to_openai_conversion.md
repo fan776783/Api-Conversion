@@ -256,6 +256,10 @@ Anthropic使用顶层`system`字段，OpenAI使用messages数组中的system角�
 }
 ```
 
+> **注意**: 在执行上述转换前，会对 `input_schema` 做一层 JSON Schema 清理：
+> - 只保留 `type`、`description`、`properties`、`required`、`enum`、`items` 等标准字段
+> - 递归移除其他非标准字段，避免下游（尤其是 OpenAI/Gemini）因不支持的关键字导致错误
+
 ### 3.4 Thinking/Reasoning模式转换
 
 当Anthropic请求包含`thinking`参数时，需要转换为OpenAI的reasoning模式：
@@ -285,15 +289,19 @@ Anthropic使用顶层`system`字段，OpenAI使用messages数组中的system角�
 
 #### reasoning_effort映射规则
 
-通过环境变量配置阈值：
+通过环境变量配置阈值（可选，有默认值）：
 
-| 环境变量 | 用途 |
-|---------|-----|
-| `ANTHROPIC_TO_OPENAI_LOW_REASONING_THRESHOLD` | budget_tokens低阈值 |
-| `ANTHROPIC_TO_OPENAI_HIGH_REASONING_THRESHOLD` | budget_tokens高阈值 |
+| 环境变量 | 用途 | 默认值 |
+|---------|-----|-------|
+| `ANTHROPIC_TO_OPENAI_LOW_REASONING_THRESHOLD` | budget_tokens低阈值 | 2048 |
+| `ANTHROPIC_TO_OPENAI_HIGH_REASONING_THRESHOLD` | budget_tokens高阈值 | 16384 |
 
 映射逻辑：
 ```python
+# 如果未提供 budget_tokens，默认使用 high
+if budget_tokens is None:
+    return "high"
+
 if budget_tokens <= low_threshold:
     reasoning_effort = "low"
 elif budget_tokens <= high_threshold:
@@ -301,6 +309,8 @@ elif budget_tokens <= high_threshold:
 else:
     reasoning_effort = "high"
 ```
+
+> **注意**: 当 `thinking.type == "enabled"` 但未提供 `budget_tokens` 时，实现会默认 `reasoning_effort = "high"`。
 
 #### max_completion_tokens优先级
 
@@ -547,22 +557,32 @@ AnthropicConverter._convert_from_openai_streaming_chunk(data)
 
 ### 6.2 状态管理
 
-流式转换使用`_streaming_state`维护跨chunk状态：
+流式转换使用统一的 `StreamState` 类（`src/formats/unified/stream_state.py`）维护跨chunk状态：
 
 ```python
-self._streaming_state = {
-    'message_id': "msg_<timestamp_ms>",
-    'model': original_model,
-    'has_started': False,
-    'has_text_content_started': False,
-    'has_finished': False,
-    'content_index': 0,
-    'text_content_index': None,
-    'tool_calls': {},  # OpenAI tool_call_index -> {...}
-    'tool_call_index_to_content_block_index': {},
-    'is_closed': False
-}
+from src.formats.unified.stream_state import StreamState, StreamPhase
+
+# 初始化流式状态
+self._openai_stream_state = StreamState(
+    model=self.original_model,
+    original_model=self.original_model,
+)
 ```
+
+`StreamState` 主要字段：
+
+| 字段 | 说明 |
+|-----|-----|
+| `stream_id` | 当前消息ID（Anthropic `message.id`） |
+| `phase` | 当前阶段（`NOT_STARTED` / `MESSAGE_STARTED` / `CONTENT_STREAMING` / `FINISHED`） |
+| `thinking_block_index` | thinking块的索引 |
+| `thinking_block_started` | 是否已开始thinking块 |
+| `text_block_index` | 文本块的索引 |
+| `text_block_started` | 是否已开始文本块 |
+| `tool_calls` | 工具调用状态字典 |
+| `tool_call_to_content_index` | 工具调用索引到内容块索引的映射 |
+| `input_tokens` / `output_tokens` | 流式累加的usage |
+| `sent_message_start` / `sent_message_stop` | 是否已发送message_start/stop事件 |
 
 ### 6.3 事件转换流程
 
@@ -610,11 +630,15 @@ data: {"type":"message_stop"}
 | 场景 | 生成的Anthropic事件 |
 |-----|-------------------|
 | 首个有意义chunk | `message_start` |
+| 首次Thinking内容（OpenAI `reasoning_content`） | `content_block_start` (type="thinking") |
+| Thinking增量 | `content_block_delta` (type="thinking_delta") |
 | 首次文本内容 | `content_block_start` (type="text") |
 | 文本增量 | `content_block_delta` (type="text_delta") |
 | 首次工具调用 | `content_block_start` (type="tool_use") |
 | 工具参数增量 | `content_block_delta` (type="input_json_delta") |
 | 流结束 | `content_block_stop` + `message_delta` + `message_stop` |
+
+> **注意**: OpenAI o1/o3 等推理模型返回的 `reasoning_content` 字段会被转换为 Anthropic 的 `thinking` 块。
 
 ### 6.5 流式工具调用处理
 
@@ -663,23 +687,30 @@ data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta"
 
 ### 6.6 JSON片段清理
 
-为避免不完整的Unicode字符或转义序列导致解析错误：
+为避免不完整的Unicode字符或转义序列导致解析错误，实现使用了健壮的清理逻辑：
 
 ```python
 def _clean_json_fragment(self, fragment: str) -> str:
-    """清理JSON片段"""
-    cleaned = fragment
+    """清理JSON片段，避免不完整的Unicode字符或转义序列"""
+    if not fragment:
+        return fragment
 
-    # 处理悬挂的反斜杠
-    if cleaned.endswith('\\') and not cleaned.endswith('\\\\'):
-        cleaned = cleaned[:-1]
+    try:
+        cleaned = fragment
 
-    # 处理不完整的Unicode转义
-    elif cleaned.endswith('\\u') or cleaned.endswith('\\u0'):
-        idx = cleaned.rfind('\\u')
-        cleaned = cleaned[:idx]
+        # 处理悬挂的反斜杠
+        if cleaned.endswith('\\') and not cleaned.endswith('\\\\'):
+            cleaned = cleaned[:-1]
+        # 处理不完整的Unicode转义（包括 \u, \u0, \u00）
+        elif cleaned.endswith('\\u') or cleaned.endswith('\\u0') or cleaned.endswith('\\u00'):
+            idx = cleaned.rfind('\\u')
+            cleaned = cleaned[:idx]
 
-    return cleaned
+        return cleaned
+
+    except Exception as e:
+        self.logger.warning(f"Error cleaning JSON fragment: {e}, returning original")
+        return fragment
 ```
 
 ---
@@ -853,14 +884,18 @@ Content-Type: application/json
 
 ## 九、环境变量配置
 
-### 必需配置
+### Thinking/Reasoning 相关配置
+
+> 说明：阈值环境变量为可选配置，未显式配置时会使用内置默认值。
 
 ```bash
-# Thinking/Reasoning参数映射阈值
+# Thinking/Reasoning参数映射阈值（可选，有默认值）
+# 默认值：LOW=2048，HIGH=16384
 ANTHROPIC_TO_OPENAI_LOW_REASONING_THRESHOLD=2000   # budget_tokens <= 此值 -> low
 ANTHROPIC_TO_OPENAI_HIGH_REASONING_THRESHOLD=8000  # budget_tokens <= 此值 -> medium, > 此值 -> high
 
-# OpenAI Reasoning模式max_completion_tokens默认值
+# OpenAI Reasoning模式 max_completion_tokens 默认值
+# 仅当启用 Thinking 且请求未提供 max_tokens 时才会使用该环境变量
 OPENAI_REASONING_MAX_TOKENS=8192
 ```
 
@@ -884,7 +919,7 @@ OPENAI_REASONING_MAX_TOKENS=8192
 | 请求转换失败 | 抛出ConversionError |
 | 响应转换失败 | 透传原始响应 |
 | JSON解析错误 | 记录日志，尝试继续 |
-| 缺少环境变量（Thinking模式） | 抛出ConversionError |
+| Thinking模式下：请求未提供 `max_tokens` 且未配置 `OPENAI_REASONING_MAX_TOKENS` | 抛出ConversionError |
 
 ### 10.3 流式处理容错
 
