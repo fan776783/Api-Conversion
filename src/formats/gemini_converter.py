@@ -11,10 +11,17 @@ from .base_converter import BaseConverter, ConversionResult, ConversionError
 
 class GeminiConverter(BaseConverter):
     """Gemini格式转换器"""
-    
+
     def __init__(self):
         super().__init__()
         self.original_model = None
+        # 用于跨 OpenAI 往返保留 Gemini thoughtSignature 的映射
+        # key: tool_call_id, value: thoughtSignature
+        self._thought_signatures_by_tool_call_id: Dict[str, str] = {}
+        # 用于保留 OpenRouter reasoning_details（按 assistant 消息的首个 tool_call_id 索引）
+        # key: first_tool_call_id, value: reasoning_details array
+        # 多轮工具调用时，每个 assistant 消息的 reasoning_details 都需要保留
+        self._reasoning_details_cache: Dict[str, List[Dict[str, Any]]] = {}
     
     def set_original_model(self, model: str):
         """设置原始模型名称"""
@@ -71,11 +78,14 @@ class GeminiConverter(BaseConverter):
         """重置所有流式相关的状态变量，避免状态污染"""
         streaming_attrs = [
             '_anthropic_stream_id', '_openai_sent_start', '_gemini_text_started',
-            '_anthropic_to_gemini_state'
+            '_anthropic_to_gemini_state', '_streaming_tool_calls'
         ]
         for attr in streaming_attrs:
             if hasattr(self, attr):
                 delattr(self, attr)
+        # 清空 thoughtSignature 映射
+        self._thought_signatures_by_tool_call_id.clear()
+        # 注意：不清空 _reasoning_details_cache，因为它需要跨请求保留以支持多轮工具调用
     
     def get_supported_formats(self) -> List[str]:
         """获取支持的格式列表"""
@@ -136,20 +146,41 @@ class GeminiConverter(BaseConverter):
     def _convert_to_openai_request(self, data: Dict[str, Any]) -> ConversionResult:
         """转换Gemini请求到OpenAI格式"""
         result_data = {}
-        
+
+        # 清空 thoughtSignature 映射，避免跨请求污染
+        self._thought_signatures_by_tool_call_id.clear()
+        # 注意：不清空 _reasoning_details_cache，因为它需要跨请求保留
+
         # 必须有原始模型名称，否则报错
         if not self.original_model:
             raise ValueError("Original model name is required for request conversion")
-        
+
         result_data["model"] = self.original_model  # 使用原始模型名称
-        
+
         # 初始化函数调用ID映射表，用于保持工具调用和工具结果的ID一致性
         # 先扫描整个对话历史，为每个functionCall和functionResponse建立映射关系
         self._function_call_mapping = self._build_function_call_mapping(data.get("contents", []))
         
         # 处理消息和系统消息
         messages = []
-        
+        # 用于去重：记录已处理的 functionResponse ID，避免 gemini-cli 发送重复消息导致 400 错误
+        _processed_function_response_ids: set = set()
+
+        # 🔍 调试日志：记录收到的 contents 结构
+        contents = data.get("contents", [])
+        print(f"📥 [GEMINI->OPENAI] Received {len(contents)} content items")
+        for idx, content in enumerate(contents):
+            role = content.get("role", "user")
+            parts = content.get("parts", [])
+            # 检查是否有 functionResponse
+            fr_ids = []
+            for part in parts:
+                if "functionResponse" in part:
+                    fr_id = part["functionResponse"].get("id", "NO_ID")
+                    fr_ids.append(fr_id)
+            if fr_ids:
+                print(f"📥 [GEMINI->OPENAI] Content[{idx}] role={role}, functionResponse IDs: {fr_ids}")
+
         # 添加系统消息 - 支持两种格式
         system_instruction_data = data.get("systemInstruction") or data.get("system_instruction")
         if system_instruction_data:
@@ -178,33 +209,43 @@ class GeminiConverter(BaseConverter):
                                 fr = part["functionResponse"]
                                 func_name = fr.get("name", "")
                                 response_content = fr.get("response", {})
-                                
+
                                 # 从响应内容中提取文本
                                 if isinstance(response_content, dict):
-                                    tool_result = response_content.get("content", json.dumps(response_content, ensure_ascii=False))
+                                    tool_result = response_content.get("content") or response_content.get("output") or json.dumps(response_content, ensure_ascii=False)
                                 else:
                                     tool_result = str(response_content)
-                                
-                                # 使用预先建立的映射获取对应的tool_call_id
-                                if not hasattr(self, '_current_response_sequence'):
-                                    self._current_response_sequence = {}
-                                
-                                sequence = self._current_response_sequence.get(func_name, 0) + 1
-                                self._current_response_sequence[func_name] = sequence
-                                
-                                tool_call_id = self._function_call_mapping.get(f"response_{func_name}_{sequence}")
+
+                                # 优先使用 functionResponse 自带的 id 字段
+                                tool_call_id = fr.get("id")
                                 if not tool_call_id:
-                                    # 如果没有映射，直接使用对应的call ID
-                                    tool_call_id = self._function_call_mapping.get(f"{func_name}_{sequence}")
+                                    # 备选：使用映射
+                                    if not hasattr(self, '_current_response_sequence'):
+                                        self._current_response_sequence = {}
+                                    sequence = self._current_response_sequence.get(func_name, 0) + 1
+                                    self._current_response_sequence[func_name] = sequence
+                                    tool_call_id = self._function_call_mapping.get(f"response_{func_name}_{sequence}")
                                     if not tool_call_id:
-                                        # 最后的备选方案：生成新的ID
-                                        tool_call_id = f"call_{func_name}_{sequence:04d}"
-                                
-                                messages.append({
+                                        tool_call_id = self._function_call_mapping.get(f"{func_name}_{sequence}")
+                                        if not tool_call_id:
+                                            tool_call_id = f"call_{func_name}_{sequence:04d}"
+
+                                # 去重：跳过已处理的 functionResponse（基于 tool_call_id）
+                                if tool_call_id in _processed_function_response_ids:
+                                    print(f"🔄 [GEMINI->OPENAI] Skipping duplicate functionResponse: {tool_call_id}")
+                                    continue
+                                _processed_function_response_ids.add(tool_call_id)
+                                print(f"✅ [GEMINI->OPENAI] Processing functionResponse: {tool_call_id}")
+
+                                # 某些 OpenAI 兼容 API 要求 tool 消息包含 name 字段
+                                tool_msg = {
                                     "role": "tool",
                                     "tool_call_id": tool_call_id,
                                     "content": tool_result
-                                })
+                                }
+                                if func_name:
+                                    tool_msg["name"] = func_name
+                                messages.append(tool_msg)
                     else:
                         # 普通用户消息
                         message_content = self._convert_content_from_gemini(parts)
@@ -216,21 +257,31 @@ class GeminiConverter(BaseConverter):
                 elif gemini_role == "model":
                     # 助手消息，可能包含工具调用
                     message_content = self._convert_content_from_gemini(parts)
-                    
+
                     if isinstance(message_content, dict) and message_content.get("type") == "tool_calls":
                         # 有工具调用的助手消息
-                        message = {
+                        # 某些 OpenAI 兼容 API 要求 content 字段必须存在（即使为空字符串）
+                        tool_call_content = message_content.get("content") or ""
+                        tool_calls = message_content["tool_calls"]
+                        message: Dict[str, Any] = {
                             "role": "assistant",
-                            "content": message_content.get("content"),
-                            "tool_calls": message_content["tool_calls"]
+                            "content": tool_call_content,
+                            "tool_calls": tool_calls
                         }
+                        # 从 cache 中查找对应的 reasoning_details（按首个 tool_call_id 索引）
+                        if tool_calls:
+                            first_tool_call_id = tool_calls[0].get("id")
+                            if first_tool_call_id and first_tool_call_id in self._reasoning_details_cache:
+                                message["reasoning_details"] = self._reasoning_details_cache[first_tool_call_id]
+                                print(f"🧠 [REASONING_DETAILS] Attached {len(message['reasoning_details'])} reasoning_details to assistant message (key={first_tool_call_id})")
                         messages.append(message)
                     else:
-                        # 普通助手消息
-                        messages.append({
+                        # 普通助手消息（无工具调用）
+                        msg: Dict[str, Any] = {
                             "role": "assistant",
                             "content": message_content
-                        })
+                        }
+                        messages.append(msg)
                         
                 elif gemini_role == "tool":
                     # 工具角色的消息，处理functionResponse
@@ -239,33 +290,43 @@ class GeminiConverter(BaseConverter):
                             fr = part["functionResponse"]
                             func_name = fr.get("name", "")
                             response_content = fr.get("response", {})
-                            
+
                             # 从响应内容中提取文本
                             if isinstance(response_content, dict):
-                                tool_result = response_content.get("content", json.dumps(response_content, ensure_ascii=False))
+                                tool_result = response_content.get("content") or response_content.get("output") or json.dumps(response_content, ensure_ascii=False)
                             else:
                                 tool_result = str(response_content)
-                            
-                            # 使用预先建立的映射获取对应的tool_call_id
-                            if not hasattr(self, '_current_response_sequence'):
-                                self._current_response_sequence = {}
-                            
-                            sequence = self._current_response_sequence.get(func_name, 0) + 1
-                            self._current_response_sequence[func_name] = sequence
-                            
-                            tool_call_id = self._function_call_mapping.get(f"response_{func_name}_{sequence}")
+
+                            # 优先使用 functionResponse 自带的 id 字段
+                            tool_call_id = fr.get("id")
                             if not tool_call_id:
-                                # 如果没有映射，直接使用对应的call ID
-                                tool_call_id = self._function_call_mapping.get(f"{func_name}_{sequence}")
+                                # 备选：使用映射
+                                if not hasattr(self, '_current_response_sequence'):
+                                    self._current_response_sequence = {}
+                                sequence = self._current_response_sequence.get(func_name, 0) + 1
+                                self._current_response_sequence[func_name] = sequence
+                                tool_call_id = self._function_call_mapping.get(f"response_{func_name}_{sequence}")
                                 if not tool_call_id:
-                                    # 最后的备选方案：生成新的ID
-                                    tool_call_id = f"call_{func_name}_{sequence:04d}"
-                            
-                            messages.append({
+                                    tool_call_id = self._function_call_mapping.get(f"{func_name}_{sequence}")
+                                    if not tool_call_id:
+                                        tool_call_id = f"call_{func_name}_{sequence:04d}"
+
+                            # 去重：跳过已处理的 functionResponse（基于 tool_call_id）
+                            if tool_call_id in _processed_function_response_ids:
+                                print(f"🔄 [GEMINI->OPENAI] Skipping duplicate functionResponse (tool role): {tool_call_id}")
+                                continue
+                            _processed_function_response_ids.add(tool_call_id)
+                            print(f"✅ [GEMINI->OPENAI] Processing functionResponse (tool role): {tool_call_id}")
+
+                            # 某些 OpenAI 兼容 API 要求 tool 消息包含 name 字段
+                            tool_msg = {
                                 "role": "tool",
                                 "tool_call_id": tool_call_id,
                                 "content": tool_result
-                            })
+                            }
+                            if func_name:
+                                tool_msg["name"] = func_name
+                            messages.append(tool_msg)
                 else:
                     # 其他角色，默认转为assistant
                     message_content = self._convert_content_from_gemini(parts)
@@ -273,7 +334,19 @@ class GeminiConverter(BaseConverter):
                         "role": "assistant",
                         "content": message_content
                     })
-        
+
+        # 合并连续的同角色消息（Gemini API 不允许连续同角色消息）
+        # 这个问题在 OpenAI → Gemini 转换时会导致 400 错误
+        messages = self._merge_consecutive_messages(messages)
+
+        # 🔍 调试日志：记录转换后的 messages 结构
+        tool_msgs = [m for m in messages if m.get("role") == "tool"]
+        tool_call_ids = [m.get("tool_call_id") for m in tool_msgs]
+        print(f"📤 [GEMINI->OPENAI] Generated {len(messages)} messages, {len(tool_msgs)} tool messages")
+        if tool_call_ids:
+            print(f"📤 [GEMINI->OPENAI] Tool message IDs: {tool_call_ids}")
+        print(f"📤 [GEMINI->OPENAI] Dedup stats: processed {len(_processed_function_response_ids)} unique functionResponse IDs")
+
         result_data["messages"] = messages
 
         # P2-14: safetySettings 透传到 metadata
@@ -313,6 +386,22 @@ class GeminiConverter(BaseConverter):
                             "schema": config["response_schema"]
                         }
                     }
+
+        # 确保有 max_tokens（某些 OpenAI 兼容 API 要求必须提供）
+        # 优先级：1. generationConfig.maxOutputTokens 2. 环境变量 3. 默认值
+        if "max_tokens" not in result_data:
+            import os
+            env_max_tokens = os.environ.get("OPENAI_DEFAULT_MAX_TOKENS")
+            if env_max_tokens:
+                try:
+                    result_data["max_tokens"] = int(env_max_tokens)
+                    self.logger.debug(f"Using OPENAI_DEFAULT_MAX_TOKENS: {result_data['max_tokens']}")
+                except ValueError:
+                    self.logger.warning(f"Invalid OPENAI_DEFAULT_MAX_TOKENS: {env_max_tokens}")
+            else:
+                # 使用合理的默认值
+                result_data["max_tokens"] = 8192
+                self.logger.debug("Using default max_tokens: 8192")
         
         # 处理工具调用
         if "tools" in data:
@@ -321,7 +410,11 @@ class GeminiConverter(BaseConverter):
             has_code_execution = False
             has_google_search = False
 
+            self.logger.info(f"🔧 [TOOLS] Processing {len(data['tools'])} tools")
+
             for tool in data["tools"]:
+                self.logger.debug(f"🔧 [TOOLS] Tool structure keys: {list(tool.keys())}")
+
                 # Gemini官方使用 snake_case: function_declarations
                 func_key = None
                 if "function_declarations" in tool:
@@ -330,14 +423,27 @@ class GeminiConverter(BaseConverter):
                     func_key = "functionDeclarations"
 
                 if func_key:
+                    self.logger.info(f"🔧 [TOOLS] Found {len(tool[func_key])} function declarations")
                     for func_decl in tool[func_key]:
+                        func_name = func_decl.get("name", "")
+                        function_def = {
+                            "name": func_name,
+                            "description": func_decl.get("description", "")
+                        }
+
+                        # 处理 parameters - 某些 OpenAI 兼容 API 要求必须有此字段
+                        if "parameters" in func_decl:
+                            raw_params = func_decl["parameters"]
+                            self.logger.debug(f"🔧 [TOOLS] Function '{func_name}' raw parameters: {raw_params}")
+                            function_def["parameters"] = self._sanitize_schema_for_openai(raw_params)
+                        else:
+                            # Gemini 没有提供 parameters，添加空的 parameters 以兼容第三方 API
+                            function_def["parameters"] = {"type": "object", "properties": {}}
+                            self.logger.debug(f"🔧 [TOOLS] Function '{func_name}' has no parameters, using empty schema")
+
                         openai_tools.append({
                             "type": "function",
-                            "function": {
-                                "name": func_decl.get("name", ""),
-                                "description": func_decl.get("description", ""),
-                                "parameters": self._sanitize_schema_for_openai(func_decl.get("parameters", {}))
-                            }
+                            "function": function_def
                         })
 
                 # 检测非函数工具类型（与 func_key 独立处理）
@@ -441,21 +547,28 @@ class GeminiConverter(BaseConverter):
                 
                 result_data["max_completion_tokens"] = max_completion_tokens
                 self.logger.info(f"Gemini thinkingBudget {thinking_budget} -> OpenAI reasoning_effort='{reasoning_effort}', max_completion_tokens={max_completion_tokens}")
-        
+
         # 处理流式参数 - 关键修复！
         if "stream" in data:
             result_data["stream"] = data["stream"]
-        
+
+        # 汇总 thoughtSignature 捕获情况
+        if self._thought_signatures_by_tool_call_id:
+            print(f"🧠 [THOUGHT_SIGNATURE] Request conversion complete. Captured {len(self._thought_signatures_by_tool_call_id)} signatures: {list(self._thought_signatures_by_tool_call_id.keys())}")
+
         return ConversionResult(success=True, data=result_data)
     
     def _convert_to_anthropic_request(self, data: Dict[str, Any]) -> ConversionResult:
         """转换Gemini请求到Anthropic格式"""
         result_data = {}
-        
+
+        # 清空 thoughtSignature 映射，避免跨请求污染
+        self._thought_signatures_by_tool_call_id.clear()
+
         # 必须有原始模型名称，否则报错
         if not self.original_model:
             raise ValueError("Original model name is required for request conversion")
-        
+
         result_data["model"] = self.original_model  # 使用原始模型名称
         
         # 处理系统消息 - 支持两种格式
@@ -650,17 +763,26 @@ class GeminiConverter(BaseConverter):
             "candidates": [],
             "usageMetadata": {}
         }
-        
+
         # 处理选择
         if "choices" in data and data["choices"] and data["choices"][0]:
             choice = data["choices"][0]
             message = choice.get("message", {})
             content = message.get("content", "")
             tool_calls = message.get("tool_calls", [])
-            
+
+            # 捕获 reasoning_details（OpenRouter 返回的推理详情）
+            # 按首个 tool_call_id 存入 cache，用于多轮工具调用时回传
+            reasoning_details = message.get("reasoning_details")
+            if reasoning_details and tool_calls:
+                first_tool_call_id = tool_calls[0].get("id") if tool_calls else None
+                if first_tool_call_id:
+                    self._reasoning_details_cache[first_tool_call_id] = reasoning_details
+                    print(f"🧠 [REASONING_DETAILS] Cached {len(reasoning_details)} reasoning_details (key={first_tool_call_id})")
+
             # 构建 parts
             parts = []
-            
+
             # 添加文本内容（如果有）
             if content:
                 parts.append({"text": content})
@@ -677,13 +799,27 @@ class GeminiConverter(BaseConverter):
                             func_args = json.loads(args_str) if args_str else {}
                         except json.JSONDecodeError:
                             func_args = {}
-                        
-                        parts.append({
-                            "functionCall": {
-                                "name": func_name,
-                                "args": func_args
-                            }
-                        })
+
+                        func_args = self._adapt_tool_call_params(func_name, func_args)
+                        function_call = {
+                            "name": func_name,
+                            "args": func_args
+                        }
+                        # 保留原始 tool_call ID，确保 functionResponse 可以使用相同的 ID
+                        tool_call_id = tool_call.get("id")
+                        if tool_call_id:
+                            function_call["id"] = tool_call_id
+
+                        # 构建 part，包含 functionCall
+                        part: Dict[str, Any] = {"functionCall": function_call}
+
+                        # 回填 thoughtSignature（如果之前捕获过）
+                        if tool_call_id and tool_call_id in self._thought_signatures_by_tool_call_id:
+                            thought_signature = self._thought_signatures_by_tool_call_id[tool_call_id]
+                            part["thoughtSignature"] = thought_signature
+                            print(f"🧠 [THOUGHT_SIGNATURE] Restored: tool_call_id={tool_call_id}, signature={thought_signature[:50]}...")
+
+                        parts.append(part)
             
             # 如果没有任何内容，添加空文本
             if not parts:
@@ -740,12 +876,27 @@ class GeminiConverter(BaseConverter):
                 
                 # 处理工具调用 (tool_use → functionCall)
                 elif item_type == "tool_use":
-                    parts.append({
-                        "functionCall": {
-                            "name": item.get("name", ""),
-                            "args": item.get("input", {})
-                        }
-                    })
+                    func_name = item.get("name", "")
+                    func_args = self._adapt_tool_call_params(func_name, item.get("input", {}))
+                    function_call = {
+                        "name": func_name,
+                        "args": func_args
+                    }
+                    # 保留 Anthropic tool_use 的 ID
+                    tool_use_id = item.get("id")
+                    if tool_use_id:
+                        function_call["id"] = tool_use_id
+
+                    # 构建 part，包含 functionCall
+                    part: Dict[str, Any] = {"functionCall": function_call}
+
+                    # 回填 thoughtSignature（如果之前捕获过）
+                    if tool_use_id and tool_use_id in self._thought_signatures_by_tool_call_id:
+                        thought_signature = self._thought_signatures_by_tool_call_id[tool_use_id]
+                        part["thoughtSignature"] = thought_signature
+                        print(f"🧠 [THOUGHT_SIGNATURE] Restored (Anthropic): tool_use_id={tool_use_id}, signature={thought_signature[:50]}...")
+
+                    parts.append(part)
         
         # 如果没有任何内容，添加空文本避免空parts数组
         if not parts:
@@ -777,10 +928,26 @@ class GeminiConverter(BaseConverter):
     def _convert_from_openai_streaming_chunk(self, data: Dict[str, Any]) -> ConversionResult:
         """转换OpenAI流式响应chunk到Gemini格式"""
         self.logger.info(f"OPENAI->GEMINI CHUNK: {data}")  # 记录输入数据
-        
+
         # 为流式工具调用维护状态
         if not hasattr(self, '_streaming_tool_calls'):
             self._streaming_tool_calls = {}
+
+        # 为流式 reasoning_details 维护临时状态（在 finish 时存入 cache）
+        if not hasattr(self, '_streaming_reasoning_details'):
+            self._streaming_reasoning_details = None
+
+        # 捕获流式响应中的 reasoning_details
+        if "choices" in data and data["choices"] and data["choices"][0]:
+            choice = data["choices"][0]
+            delta = choice.get("delta", {})
+
+            # reasoning_details 可能在 delta 或顶层 message 中
+            reasoning_details = delta.get("reasoning_details") or choice.get("message", {}).get("reasoning_details")
+            if reasoning_details:
+                self._streaming_reasoning_details = reasoning_details
+                print(f"🧠 [REASONING_DETAILS] Captured {len(reasoning_details)} reasoning_details from streaming chunk")
+
         # 先处理增量内容和工具调用（收集状态）
         if "choices" in data and data["choices"] and data["choices"][0]:
             choice = data["choices"][0]
@@ -830,6 +997,17 @@ class GeminiConverter(BaseConverter):
             # 处理收集到的工具调用
             if self._streaming_tool_calls:
                 self.logger.debug(f"FINISH: Processing collected tool calls: {self._streaming_tool_calls}")
+
+                # 在流式结束时，将 reasoning_details 存入 cache（按首个 tool_call_id 索引）
+                if hasattr(self, '_streaming_reasoning_details') and self._streaming_reasoning_details:
+                    # 获取首个 tool_call_id
+                    first_index = min(self._streaming_tool_calls.keys())
+                    first_tool_call_id = self._streaming_tool_calls[first_index].get("id")
+                    if first_tool_call_id:
+                        self._reasoning_details_cache[first_tool_call_id] = self._streaming_reasoning_details
+                        print(f"🧠 [REASONING_DETAILS] Cached {len(self._streaming_reasoning_details)} reasoning_details from streaming (key={first_tool_call_id})")
+                    self._streaming_reasoning_details = None
+
                 for call_index, tool_call in self._streaming_tool_calls.items():
                     func = tool_call.get("function", {})
                     func_name = func.get("name", "")
@@ -846,12 +1024,26 @@ class GeminiConverter(BaseConverter):
                         self.logger.error(f"JSON decode error in tool args: {e}, func_args: '{func_args}'")
                         func_args_json = {}
 
-                    parts.append({
-                        "functionCall": {
-                            "name": func_name,
-                            "args": func_args_json
-                        }
-                    })
+                    func_args_json = self._adapt_tool_call_params(func_name, func_args_json)
+                    function_call = {
+                        "name": func_name,
+                        "args": func_args_json
+                    }
+                    # 保留原始 tool_call ID
+                    tool_call_id = tool_call.get("id")
+                    if tool_call_id:
+                        function_call["id"] = tool_call_id
+
+                    # 构建 part，包含 functionCall
+                    part: Dict[str, Any] = {"functionCall": function_call}
+
+                    # 回填 thoughtSignature（如果之前捕获过）
+                    if tool_call_id and tool_call_id in self._thought_signatures_by_tool_call_id:
+                        thought_signature = self._thought_signatures_by_tool_call_id[tool_call_id]
+                        part["thoughtSignature"] = thought_signature
+                        print(f"🧠 [THOUGHT_SIGNATURE] Restored (streaming): tool_call_id={tool_call_id}, signature={thought_signature[:50]}...")
+
+                    parts.append(part)
                 
                 # 清理工具调用状态，为下次请求做准备
                 self._streaming_tool_calls = {}
@@ -946,23 +1138,48 @@ class GeminiConverter(BaseConverter):
             
             # 只添加工具调用（文本内容已经在之前的text_delta中发送过了）
             for tool_info in state['current_tool_calls'].values():
-                if tool_info.get('name') and tool_info.get('complete_args'):
+                tool_name = tool_info.get('name')
+                tool_use_id = tool_info.get('id')
+                if tool_name and tool_info.get('complete_args'):
                     try:
                         args_obj = json.loads(tool_info['complete_args'])
-                        parts.append({
-                            "functionCall": {
-                                "name": tool_info['name'],
-                                "args": args_obj
-                            }
-                        })
+                        args_obj = self._adapt_tool_call_params(tool_name, args_obj)
+                        function_call = {
+                            "name": tool_name,
+                            "args": args_obj
+                        }
+                        # 保留 Anthropic tool_use 的 ID
+                        if tool_use_id:
+                            function_call["id"] = tool_use_id
+
+                        # 构建 part，包含 functionCall
+                        part: Dict[str, Any] = {"functionCall": function_call}
+
+                        # 回填 thoughtSignature（如果之前捕获过）
+                        if tool_use_id and tool_use_id in self._thought_signatures_by_tool_call_id:
+                            thought_signature = self._thought_signatures_by_tool_call_id[tool_use_id]
+                            part["thoughtSignature"] = thought_signature
+                            print(f"🧠 [THOUGHT_SIGNATURE] Restored (Anthropic streaming): tool_use_id={tool_use_id}, signature={thought_signature[:50]}...")
+
+                        parts.append(part)
                     except json.JSONDecodeError:
-                        # 如果JSON解析失败，使用空参数
-                        parts.append({
-                            "functionCall": {
-                                "name": tool_info['name'],
-                                "args": {}
-                            }
-                        })
+                        function_call = {
+                            "name": tool_name,
+                            "args": {}
+                        }
+                        if tool_use_id:
+                            function_call["id"] = tool_use_id
+
+                        # 构建 part，包含 functionCall
+                        part_err: Dict[str, Any] = {"functionCall": function_call}
+
+                        # 回填 thoughtSignature（如果之前捕获过）
+                        if tool_use_id and tool_use_id in self._thought_signatures_by_tool_call_id:
+                            thought_signature = self._thought_signatures_by_tool_call_id[tool_use_id]
+                            part_err["thoughtSignature"] = thought_signature
+                            print(f"🧠 [THOUGHT_SIGNATURE] Restored (Anthropic streaming, decode error): tool_use_id={tool_use_id}, signature={thought_signature[:50]}...")
+
+                        parts.append(part_err)
             
             # 确定finish reason
             stop_reason = data["delta"]["stop_reason"]
@@ -1211,20 +1428,28 @@ class GeminiConverter(BaseConverter):
                 fc = part["functionCall"]
                 func_name = fc.get("name", "")
                 func_args = fc.get("args", {})
-                
-                # 使用预先建立的ID映射
-                # 为每个函数调用使用序列号确保唯一性
-                if not hasattr(self, '_current_call_sequence'):
-                    self._current_call_sequence = {}
-                
-                sequence = self._current_call_sequence.get(func_name, 0) + 1
-                self._current_call_sequence[func_name] = sequence
-                
-                tool_call_id = self._function_call_mapping.get(f"{func_name}_{sequence}")
+
+                # 优先使用 functionCall 自带的 id 字段（与 functionResponse 中的 id 保持一致）
+                tool_call_id = fc.get("id")
                 if not tool_call_id:
-                    # 如果映射中没有找到，生成新的ID
-                    tool_call_id = f"call_{func_name}_{sequence:04d}"
-                
+                    # 备选：使用预先建立的ID映射
+                    if not hasattr(self, '_current_call_sequence'):
+                        self._current_call_sequence = {}
+
+                    sequence = self._current_call_sequence.get(func_name, 0) + 1
+                    self._current_call_sequence[func_name] = sequence
+
+                    tool_call_id = self._function_call_mapping.get(f"{func_name}_{sequence}")
+                    if not tool_call_id:
+                        # 如果映射中没有找到，生成新的ID
+                        tool_call_id = f"call_{func_name}_{sequence:04d}"
+
+                # 提取并保存 thoughtSignature（用于后续回传）
+                thought_signature = part.get("thoughtSignature")
+                if thought_signature:
+                    self._thought_signatures_by_tool_call_id[tool_call_id] = thought_signature
+                    print(f"🧠 [THOUGHT_SIGNATURE] Captured: tool_call_id={tool_call_id}, signature={thought_signature[:50]}...")
+
                 tool_calls.append({
                     "id": tool_call_id,
                     "type": "function",
@@ -1444,6 +1669,62 @@ class GeminiConverter(BaseConverter):
 
         return format_mapping.get(subtype, subtype or "wav")
 
+    def _merge_consecutive_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """合并连续的同角色消息
+
+        Gemini API 不允许连续的同角色消息（如连续两条 user 消息），会返回 400 错误。
+        此方法将连续的同角色文本消息合并为一条，以避免该限制。
+
+        注意：只合并纯文本消息，不合并包含 tool_calls 或 tool_call_id 的消息。
+        """
+        if not messages or len(messages) < 2:
+            return messages
+
+        merged = []
+        i = 0
+        while i < len(messages):
+            current = messages[i]
+            role = current.get("role")
+            content = current.get("content")
+
+            # 只对纯文本消息进行合并（不含 tool_calls / tool_call_id）
+            if (role in ("user", "assistant")
+                and "tool_calls" not in current
+                and "tool_call_id" not in current
+                and isinstance(content, str)):
+
+                # 收集所有连续的同角色纯文本消息
+                texts = [content]
+                j = i + 1
+                while j < len(messages):
+                    next_msg = messages[j]
+                    next_role = next_msg.get("role")
+                    next_content = next_msg.get("content")
+                    if (next_role == role
+                        and "tool_calls" not in next_msg
+                        and "tool_call_id" not in next_msg
+                        and isinstance(next_content, str)):
+                        texts.append(next_content)
+                        j += 1
+                    else:
+                        break
+
+                if len(texts) > 1:
+                    # 合并为单条消息
+                    merged.append({
+                        "role": role,
+                        "content": "\n\n".join(texts)
+                    })
+                    self.logger.debug(f"Merged {len(texts)} consecutive {role} messages")
+                else:
+                    merged.append(current)
+                i = j
+            else:
+                merged.append(current)
+                i += 1
+
+        return merged
+
     def _sanitize_schema_for_openai(self, schema: Dict[str, Any]) -> Dict[str, Any]:
         """将Gemini格式的JSON Schema转换为OpenAI兼容的格式"""
         if not isinstance(schema, dict) or not schema:
@@ -1499,19 +1780,20 @@ class GeminiConverter(BaseConverter):
         """扫描整个对话历史，为functionCall和functionResponse建立ID映射"""
         mapping = {}
         function_call_sequence = {}  # {func_name: sequence_number}
-        
+
         for content in contents:
             parts = content.get("parts", [])
             for part in parts:
                 if "functionCall" in part:
-                    func_name = part["functionCall"].get("name", "")
+                    fc = part["functionCall"]
+                    func_name = fc.get("name", "")
                     if func_name:
                         # 为每个函数调用生成唯一的sequence number
                         sequence = function_call_sequence.get(func_name, 0) + 1
                         function_call_sequence[func_name] = sequence
-                        
-                        # 生成一致的ID
-                        tool_call_id = f"call_{func_name}_{sequence:04d}"
+
+                        # 优先使用上游提供的 id，保证与 functionResponse 一致
+                        tool_call_id = fc.get("id") or f"call_{func_name}_{sequence:04d}"
                         mapping[f"{func_name}_{sequence}"] = tool_call_id
                         
                 elif "functionResponse" in part:
@@ -1567,6 +1849,43 @@ class GeminiConverter(BaseConverter):
             return obj
         
         return convert_types(converted)
+
+    def _adapt_tool_call_params(self, tool_name: str, args: Any) -> Any:
+        """适配工具调用参数到预期的schema
+
+        处理已知的不兼容情况，例如：
+        - ReadFile: paths/path -> file_path
+        """
+        if not isinstance(args, dict):
+            return args
+
+        adapted = dict(args)
+
+        # gemini-cli 内置 read_file/ReadFile 工具：paths/path -> file_path
+        if tool_name.lower() in ("readfile", "read_file") and "file_path" not in adapted:
+            # 优先处理 paths（复数）
+            paths = adapted.get("paths")
+            if isinstance(paths, list) and paths:
+                adapted["file_path"] = paths[0]
+                del adapted["paths"]
+                if len(paths) > 1:
+                    self.logger.warning(f"ReadFile: only first path used, {len(paths)-1} paths ignored")
+            elif isinstance(paths, str) and paths:
+                adapted["file_path"] = paths
+                del adapted["paths"]
+            # 兼容 Gemini 模型使用的单数 path 字段
+            elif "path" in adapted:
+                single_path = adapted["path"]
+                if isinstance(single_path, str) and single_path:
+                    adapted["file_path"] = single_path
+                    del adapted["path"]
+                elif isinstance(single_path, list) and single_path:
+                    adapted["file_path"] = single_path[0]
+                    del adapted["path"]
+                    if len(single_path) > 1:
+                        self.logger.warning(f"ReadFile: only first path used from 'path', {len(single_path)-1} ignored")
+
+        return adapted
 
     def _map_finish_reason(self, reason: str, source_format: str, target_format: str) -> str:
         """映射结束原因"""
