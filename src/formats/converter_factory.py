@@ -2,6 +2,8 @@
 转换器工厂
 负责创建和管理不同格式的转换器
 """
+import contextvars
+import os
 from typing import Dict, Optional
 from .base_converter import BaseConverter, ConversionResult
 from .openai_converter import OpenAIConverter
@@ -10,6 +12,14 @@ from .gemini_converter import GeminiConverter
 from src.utils.logger import setup_logger
 
 logger = setup_logger("converter_factory")
+
+# Streaming debug can explode quickly. Default behavior: log only the first few
+# chunks and then every N chunks, unless STREAM_TRACE_LOG=1 is enabled.
+_STREAM_TRACE_LOG = os.environ.get("STREAM_TRACE_LOG", "").lower() in ("1", "true", "yes", "on")
+try:
+    _STREAM_CHUNK_LOG_EVERY_N = int(os.environ.get("STREAM_CHUNK_LOG_EVERY_N", "50"))
+except ValueError:
+    _STREAM_CHUNK_LOG_EVERY_N = 50
 
 
 class ConverterFactory:
@@ -53,6 +63,52 @@ class ConverterFactory:
         return format_name in cls.get_supported_formats()
 
 
+# Per-request streaming converters.
+#
+# ConverterFactory caches singletons. Streaming conversion relies on mutable
+# per-stream state (e.g. "sent message_start" flags). Using cached singletons can
+# cause state bleed between concurrent requests. ContextVar keeps an isolated
+# cache per asyncio task/request.
+_STREAM_CONVERTERS_CTX: contextvars.ContextVar[Optional[Dict[str, BaseConverter]]] = contextvars.ContextVar(
+    "STREAM_CONVERTERS_CTX",
+    default=None,
+)
+
+
+def _get_stream_converters() -> Dict[str, BaseConverter]:
+    converters = _STREAM_CONVERTERS_CTX.get()
+    if converters is None:
+        converters = {}
+        _STREAM_CONVERTERS_CTX.set(converters)
+    return converters
+
+
+def clear_stream_converters() -> None:
+    """Clear per-request streaming converter cache."""
+    _STREAM_CONVERTERS_CTX.set(None)
+
+
+def _get_stream_converter(format_name: str) -> Optional[BaseConverter]:
+    converters = _get_stream_converters()
+    converter = converters.get(format_name)
+    if converter is not None:
+        return converter
+
+    # Avoid using ConverterFactory singleton cache and avoid INFO log spam.
+    converter_class = {
+        "openai": OpenAIConverter,
+        "anthropic": AnthropicConverter,
+        "gemini": GeminiConverter,
+    }.get(format_name)
+    if converter_class is None:
+        logger.error(f"Unsupported format: {format_name}")
+        return None
+
+    converter = converter_class()
+    converters[format_name] = converter
+    return converter
+
+
 # 便捷函数
 def convert_request(source_format: str, target_format: str, data: dict, headers: dict = None):
     """转换请求格式"""
@@ -85,8 +141,6 @@ def convert_streaming_chunk(source_format: str, target_format: str, data: dict, 
     import logging
     # 使用与unified_api相同的logger名称确保日志输出
     logger = logging.getLogger("unified_api")
-    logger.debug(f"CONVERTER_FACTORY: convert_streaming_chunk called: {source_format} -> {target_format}")
-    logger.debug(f"CONVERTER_FACTORY: Data type: {type(data)}, keys: {list(data.keys()) if isinstance(data, dict) else 'not dict'}")
     
     # 验证输入参数
     if not data:
@@ -98,9 +152,40 @@ def convert_streaming_chunk(source_format: str, target_format: str, data: dict, 
         logger.debug(f"Same format ({source_format}), returning data without conversion")
         return ConversionResult(success=True, data=data)
     
-    converter = ConverterFactory.get_converter(target_format)
+    converter = _get_stream_converter(target_format)
     if not converter:
         raise ValueError(f"Unsupported target format: {target_format}")
+
+    # Per-stream chunk counter (stored on the converter instance) to sample logs.
+    cnt = getattr(converter, "_cf_stream_chunk_count", 0) + 1
+    setattr(converter, "_cf_stream_chunk_count", cnt)
+
+    # Detect finish-ish chunks to always log them.
+    is_finish = False
+    if isinstance(data, dict):
+        if source_format == "openai" and "choices" in data:
+            choices = data.get("choices", [])
+            if choices and choices[0].get("finish_reason"):
+                is_finish = True
+        elif source_format == "gemini" and "candidates" in data:
+            cands = data.get("candidates", [])
+            if cands and cands[0].get("finishReason"):
+                is_finish = True
+        elif source_format == "anthropic" and data.get("type") in ("message_stop",):
+            is_finish = True
+
+    should_log = (
+        _STREAM_TRACE_LOG
+        or cnt <= 3
+        or (_STREAM_CHUNK_LOG_EVERY_N > 0 and cnt % _STREAM_CHUNK_LOG_EVERY_N == 0)
+        or is_finish
+    )
+    if should_log:
+        keys = list(data.keys()) if isinstance(data, dict) else "not dict"
+        logger.debug(
+            f"CONVERTER_FACTORY: convert_streaming_chunk called: {source_format} -> {target_format} "
+            f"(n={cnt}, finish={is_finish}), keys={keys}"
+        )
     
     # 传递原始模型名称给转换器
     if hasattr(converter, 'set_original_model') and original_model:
@@ -117,11 +202,26 @@ def convert_streaming_chunk(source_format: str, target_format: str, data: dict, 
             candidates = data.get("candidates", [])
             if candidates and not candidates[0].get("finishReason"):
                 is_stream_start = True
-        # OpenAI格式：检查是否是第一个chunk（通常包含role信息）
+        # OpenAI格式：一些上游（例如 Bedrock/OpenAI 兼容网关）可能在每个chunk都带上 delta.role。
+        # 不能仅凭 role=assistant 判断“流开始”，否则会导致每个chunk都 reset，进而重复产出 message_start 等事件。
         elif source_format == "openai" and "choices" in data:
-            choices = data.get("choices", [])
-            if choices and choices[0].get("delta", {}).get("role") == "assistant":
-                is_stream_start = True
+            # 1) 优先使用流内稳定的 id 来判定是否为新流。
+            stream_id = data.get("id")
+            if isinstance(stream_id, str) and stream_id:
+                last_stream_id = getattr(converter, "_cf_last_openai_stream_id", None)
+                if last_stream_id != stream_id:
+                    is_stream_start = True
+                    setattr(converter, "_cf_last_openai_stream_id", stream_id)
+            else:
+                # 2) 退化策略：仅当 delta 只包含 role（通常为第一帧）时认为是流开始。
+                choices = data.get("choices", [])
+                if choices:
+                    delta = choices[0].get("delta", {}) or {}
+                    if isinstance(delta, dict) and delta.get("role") == "assistant":
+                        # 避免把带 content/tool_calls 的chunk当作开始
+                        delta_keys = set(delta.keys())
+                        if delta_keys == {"role"}:
+                            is_stream_start = True
         # Anthropic格式：检查message_start事件
         elif source_format == "anthropic" and data.get("type") == "message_start":
             is_stream_start = True

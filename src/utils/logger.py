@@ -36,12 +36,15 @@ def enable_debug(enabled: bool = True):
     global _debug_mode
     _debug_mode = enabled
 
-    # 更新所有已创建的 logger 的级别
-    target_level = logging.DEBUG if enabled else logging.INFO
+    # 更新所有已创建的 logger 的级别。
+    # 注意：调试模式下我们希望“文件里更详细、控制台更简洁”，所以不要把所有 handler 都强行设成 DEBUG。
     for logger in _loggers.values():
-        logger.setLevel(target_level)
-        for handler in logger.handlers:
-            handler.setLevel(target_level)
+        try:
+            # 复用 setup_logger 的环境变量策略重新设置 handler 等级
+            _reconfigure_logger_handlers(logger)
+        except Exception:
+            # 保底：至少把 logger 本身放到 DEBUG，避免完全丢失 debug 记录
+            logger.setLevel(logging.DEBUG if enabled else logging.INFO)
 
 
 def setup_logger(name: str, level: str = None) -> logging.Logger:
@@ -53,17 +56,32 @@ def setup_logger(name: str, level: str = None) -> logging.Logger:
     # 导入环境配置
     try:
         from src.utils.env_config import env_config
-        log_level = level or env_config.log_level
+        base_level = (level or env_config.log_level).upper()
         log_file = env_config.log_file
         log_max_days = env_config.log_max_days
     except ImportError:
         # 如果无法导入环境配置，使用默认值
-        log_level = level or "WARNING"
+        base_level = (level or ("DEBUG" if _debug_mode else "WARNING")).upper()
         log_file = "logs/app.log"
         log_max_days = 1
 
+    # 支持把控制台和文件的日志级别拆开：
+    # - 默认不设置 CONSOLE_LOG_LEVEL/FILE_LOG_LEVEL 时，保持兼容（两者都跟 base_level 一致）
+    # - 调试模式下优先提升 FILE_LOG_LEVEL 到 DEBUG，便于落盘分析，同时控制台可保持更简洁
+    console_level = os.environ.get("CONSOLE_LOG_LEVEL", base_level).upper()
+    file_level = os.environ.get("FILE_LOG_LEVEL", base_level).upper()
+    if _debug_mode:
+        file_level = "DEBUG"
+        # Debug runs are typically for investigation; keep console readable by default.
+        if "CONSOLE_LOG_LEVEL" not in os.environ:
+            console_level = "INFO"
+
+    def _lvl(s: str) -> int:
+        return int(getattr(logging, s, logging.INFO))
+
     logger = logging.getLogger(name)
-    logger.setLevel(getattr(logging, log_level.upper()))
+    # logger level must be <= each handler level to allow records through.
+    logger.setLevel(min(_lvl(console_level), _lvl(file_level)))
 
     # 清除现有处理器
     logger.handlers.clear()
@@ -75,8 +93,10 @@ def setup_logger(name: str, level: str = None) -> logging.Logger:
 
     # 创建控制台处理器
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(getattr(logging, log_level.upper()))
+    console_handler.setLevel(_lvl(console_level))
     console_handler.setFormatter(formatter)
+    # mark for enable_debug() reconfigure
+    console_handler._handler_role = "console"  # type: ignore[attr-defined]
     logger.addHandler(console_handler)
 
     # 创建文件处理器（时间轮转）
@@ -98,8 +118,9 @@ def setup_logger(name: str, level: str = None) -> logging.Logger:
         # 设置轮转文件的命名格式
         file_handler.suffix = "%Y-%m-%d"
 
-        file_handler.setLevel(getattr(logging, log_level.upper()))
+        file_handler.setLevel(_lvl(file_level))
         file_handler.setFormatter(formatter)
+        file_handler._handler_role = "file"  # type: ignore[attr-defined]
         logger.addHandler(file_handler)
 
     except Exception as e:
@@ -121,6 +142,34 @@ def setup_logger(name: str, level: str = None) -> logging.Logger:
     _loggers[name] = logger
 
     return logger
+
+
+def _reconfigure_logger_handlers(logger: logging.Logger) -> None:
+    """Refresh handler levels for an already-created logger based on current env/debug flags."""
+    try:
+        from src.utils.env_config import env_config
+        base_level = env_config.log_level.upper()
+    except Exception:
+        base_level = "WARNING"
+
+    console_level = os.environ.get("CONSOLE_LOG_LEVEL", base_level).upper()
+    file_level = os.environ.get("FILE_LOG_LEVEL", base_level).upper()
+    if _debug_mode:
+        file_level = "DEBUG"
+        if "CONSOLE_LOG_LEVEL" not in os.environ:
+            console_level = "INFO"
+
+    def _lvl(s: str) -> int:
+        return int(getattr(logging, s, logging.INFO))
+
+    logger.setLevel(min(_lvl(console_level), _lvl(file_level)))
+
+    for h in list(getattr(logger, "handlers", [])):
+        role = getattr(h, "_handler_role", None)
+        if role == "console":
+            h.setLevel(_lvl(console_level))
+        elif role == "file":
+            h.setLevel(_lvl(file_level))
 
 
 def get_logger(name: str) -> logging.Logger:

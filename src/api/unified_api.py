@@ -14,7 +14,13 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from channels.channel_manager import channel_manager, ChannelInfo
-from formats.converter_factory import ConverterFactory, convert_request, convert_response, convert_streaming_chunk
+from formats.converter_factory import (
+    ConverterFactory,
+    convert_request,
+    convert_response,
+    convert_streaming_chunk,
+    clear_stream_converters,
+)
 from formats.base_converter import ConversionResult
 from utils.security import mask_api_key, safe_log_request, safe_log_response
 from src.utils.logger import (
@@ -29,6 +35,8 @@ from src.core.gateway_config import load_gateway_config
 from api.conversion_api import detect_request_format
 
 logger = setup_logger("unified_api")
+STREAM_TRACE_LOG = env_config.get_bool("STREAM_TRACE_LOG", False)
+STREAM_CHUNK_LOG_EVERY_N = env_config.get_int("STREAM_CHUNK_LOG_EVERY_N", 50)
 
 router = APIRouter()
 
@@ -504,6 +512,12 @@ async def forward_request_to_channel(
     else:
         raise ValueError(f"Unsupported provider: {channel.provider}")
     
+    logger.info(
+        f"Conversion summary: {source_format}->{channel.provider}, "
+        f"streaming={is_streaming}, model={request_data.get('model')}, "
+        f"mapped_model={mapped_model or request_data.get('model')}"
+    )
+
     # 3. 统一请求处理
     try:
         logger.debug(f"Sending {'streaming' if is_streaming else 'non-streaming'} request to {channel.provider}: {url}")
@@ -629,9 +643,13 @@ async def handle_streaming_response(response, channel, request_data, source_form
     logger.debug(f"Received streaming response from {channel.provider}: status={response.status_code}")
     
     if response.status_code == 200:
+        # 为当前请求流初始化独立的 converter 上下文，避免并发状态串扰
+        clear_stream_converters()
+
         # 流式处理响应
         logger.debug("Starting to process streaming response")
         chunk_count = 0
+        sent_end_marker = False
         
         # 根据客户端期望的格式选择合适的结束标记
         if source_format == "openai":
@@ -665,8 +683,9 @@ async def handle_streaming_response(response, channel, request_data, source_form
             return
 
         async for line in response.aiter_lines():
-            # 记录所有接收到的行用于调试
-            logger.debug(f"Received SSE line: '{line}'")
+            # 逐行日志非常高噪音，默认关闭；需要时可设置 STREAM_TRACE_LOG=1
+            if STREAM_TRACE_LOG:
+                logger.debug(f"Received SSE line: '{line}'")
             
             # 只处理以 "data: " 开头的行，其余 SSE 行（如 event: keep-alive）直接忽略
             if not line.startswith("data: "):
@@ -677,20 +696,30 @@ async def handle_streaming_response(response, channel, request_data, source_form
 
             data_content = line[6:]  # 移除 "data: " 前缀
             chunk_count += 1
-            logger.debug(f"RAW CHUNK {chunk_count}: '{data_content}'")  # 详细记录原始数据
+            should_log_chunk = (
+                STREAM_TRACE_LOG
+                or chunk_count <= 3
+                or (STREAM_CHUNK_LOG_EVERY_N > 0 and chunk_count % STREAM_CHUNK_LOG_EVERY_N == 0)
+            )
+            if should_log_chunk and STREAM_TRACE_LOG:
+                logger.debug(f"RAW CHUNK {chunk_count}: '{data_content}'")
 
             # 处理结束哨兵或空数据 - 必须在JSON解析之前检查
             if data_content.strip() in ("[DONE]", ""):
                 logger.info(f"Stream ended with marker: '{data_content.strip()}'")
                 logger.info(f"Sending end_marker to client: '{end_marker}'")
-                if end_marker:  # 只有非空的end_marker才发送
+                if end_marker and not sent_end_marker:  # 避免重复发送结束事件
                     yield end_marker
+                    sent_end_marker = True
                 break
             
             try:
                 # 解析JSON数据
                 chunk_data = json.loads(data_content)
-                logger.debug(f"Parsed chunk data: {chunk_data}")
+                if should_log_chunk:
+                    # 只打印结构摘要，避免 body 过大
+                    keys = list(chunk_data.keys()) if isinstance(chunk_data, dict) else []
+                    logger.debug(f"Parsed chunk {chunk_count}: type={type(chunk_data).__name__}, keys={keys}")
                 
                 # 通用的chunk处理逻辑：检查是否有内容和结束标记
                 # 这里不应该假设特定的格式结构，让转换器来处理格式差异
@@ -754,7 +783,10 @@ async def handle_streaming_response(response, channel, request_data, source_form
                             has_content = False
                         # 其他未知类型默认不处理
                 
-                logger.debug(f"Chunk {chunk_count} analysis: has_content={has_content}, is_finish_chunk={is_finish_chunk}")
+                if should_log_chunk or is_finish_chunk:
+                    logger.debug(
+                        f"Chunk {chunk_count} analysis: has_content={has_content}, is_finish_chunk={is_finish_chunk}"
+                    )
                 
                 # 如果有内容，转换并发送内容chunk（不管是否也是结束chunk）
                 if has_content:
@@ -775,21 +807,35 @@ async def handle_streaming_response(response, channel, request_data, source_form
                     
                     if response_conversion and response_conversion.success:
                         converted_data = response_conversion.data
+
+                        # 对于 Anthropic SSE：如果转换器已经输出 message_stop，就不要再额外补一个 end_marker。
+                        if source_format == "anthropic":
+                            if isinstance(converted_data, str) and "event: message_stop" in converted_data:
+                                sent_end_marker = True
+                            elif isinstance(converted_data, list) and any("event: message_stop" in ev for ev in converted_data):
+                                sent_end_marker = True
                         
                         if isinstance(converted_data, str):
                             # 如果是SSE格式字符串（Anthropic），直接输出
                             if converted_data.strip():  # 只有非空字符串才输出
-                                logger.debug(f"Sending SSE chunk {chunk_count}: {converted_data[:100]}...")
+                                if should_log_chunk or is_finish_chunk:
+                                    logger.debug(
+                                        f"Sending SSE chunk {chunk_count}: {converted_data[:100]}..."
+                                    )
                                 yield converted_data
                         elif isinstance(converted_data, list):
                             # 多个事件，逐个发送保持事件边界
                             for ev in converted_data:
                                 if ev.strip():
-                                    logger.debug(f"Sending SSE chunk {chunk_count}: {ev[:100]}...")
+                                    if should_log_chunk or is_finish_chunk:
+                                        logger.debug(
+                                            f"Sending SSE chunk {chunk_count}: {ev[:100]}..."
+                                        )
                                     yield ev
                         else:
                             # 如果是JSON对象（OpenAI/Gemini），包装成data字段
-                            logger.debug(f"Sending JSON chunk {chunk_count} to client: {json.dumps(converted_data, ensure_ascii=False)}")
+                            if should_log_chunk or is_finish_chunk:
+                                logger.debug(f"Sending JSON chunk {chunk_count} to client")
                             yield f"data: {json.dumps(converted_data, ensure_ascii=False)}\n\n"
                     else:
                         # 如果转换失败，返回原始数据
@@ -819,12 +865,19 @@ async def handle_streaming_response(response, channel, request_data, source_form
                         logger.error(f"Traceback: {traceback.format_exc()}")
                         # 发送原始数据作为后备
                         yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
-                        if end_marker:  # 只有非空的end_marker才发送
+                        if end_marker and not sent_end_marker:  # 避免重复发送结束事件
                             yield end_marker
+                            sent_end_marker = True
                         break
                     
                     if response_conversion and response_conversion.success:
                         converted_data = response_conversion.data
+
+                        if source_format == "anthropic":
+                            if isinstance(converted_data, str) and "event: message_stop" in converted_data:
+                                sent_end_marker = True
+                            elif isinstance(converted_data, list) and any("event: message_stop" in ev for ev in converted_data):
+                                sent_end_marker = True
                         if isinstance(converted_data, list):
                             # 如果是事件列表（Anthropic），逐个发送每个完整事件
                             for event in converted_data:
@@ -840,8 +893,9 @@ async def handle_streaming_response(response, channel, request_data, source_form
                             yield f"data: {json.dumps(converted_data, ensure_ascii=False)}\n\n"
                     
                     # 发送结束标记
-                    if end_marker:  # 只有非空的end_marker才发送
+                    if end_marker and not sent_end_marker:  # 避免重复发送结束事件
                         yield end_marker
+                        sent_end_marker = True
                     break
                     
             except json.JSONDecodeError as e:
@@ -866,7 +920,9 @@ async def handle_streaming_response(response, channel, request_data, source_form
                 # 特殊处理：如果数据内容看起来像[DONE]但被其他字符包围
                 if "[DONE]" in data_content:
                     logger.warning(f"Found [DONE] in malformed chunk: '{data_content}', sending end marker")
-                    yield end_marker
+                    if end_marker and not sent_end_marker:
+                        yield end_marker
+                        sent_end_marker = True
                     break
                 
                 # 对于其他非法JSON，尝试透传（保持连接）
@@ -874,7 +930,10 @@ async def handle_streaming_response(response, channel, request_data, source_form
                 yield f"data: {data_content}\n\n"
                 continue
         
-        logger.debug(f"Streaming completed. Total chunks processed: {chunk_count}")
+        logger.info(
+            f"Streaming completed: provider={channel.provider}, client_format={source_format}, "
+            f"chunks={chunk_count}, end_marker_sent={sent_end_marker}"
+        )
         
         # 如果没有处理任何chunks，发送错误响应
         if chunk_count == 0:
@@ -892,8 +951,9 @@ async def handle_streaming_response(response, channel, request_data, source_form
                 }]
             }
             yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
-            if end_marker:  # 只有非空的end_marker才发送
+            if end_marker and not sent_end_marker:  # 避免重复发送结束事件
                 yield end_marker
+                sent_end_marker = True
     else:
         body_bytes = await response.aread()
         try:
@@ -1359,6 +1419,7 @@ async def handle_unified_request(request, api_key: str, source_format: str):
             )
         else:
             # 非流式请求
+            logger.debug(f"Input request data: {safe_log_request(request_data)}")
             logger.debug("Processing non-streaming request")
             response_data = await forward_request_to_channel(
                 channel=channel,
@@ -2076,12 +2137,21 @@ async def gateway_proxy(full_path: str, request: Request):
     # 简洁的请求信息日志
     logger.info(f"📨 Gateway request: model={original_model}, format={source_format}->{config.provider}, streaming={is_streaming}")
 
+    incoming_headers = dict(request.headers)
+    incoming_query = dict(request.query_params)
+    logger.debug(
+        f"Gateway input detail: method={request.method}, path=/gateway/{full_path}, "
+        f"query={safe_log_request(incoming_query)}, headers={safe_log_request(incoming_headers)}"
+    )
+    if has_body:
+        logger.debug(f"Gateway input body: {safe_log_request(request_data)}")
+
     # 6. 记录请求日志
     log_request_entry(
         logger,
         request_method=request.method,
         request_url=str(request.url),
-        request_headers=dict(request.headers),
+        request_headers=incoming_headers,
         source_format=source_format,
         model=original_model,
         is_streaming=is_streaming,
@@ -2101,7 +2171,7 @@ async def gateway_proxy(full_path: str, request: Request):
                 source_format,
                 config.provider,
                 request_data,
-                headers=dict(request.headers),
+                headers=incoming_headers,
             )
             if not conversion_result.success:
                 raise HTTPException(
@@ -2204,6 +2274,12 @@ async def gateway_proxy(full_path: str, request: Request):
             target_headers["Accept"] = "text/event-stream"
 
     logger.debug(f"Gateway forwarding to: {url}")
+    logger.debug(
+        f"Gateway upstream request: provider={config.provider}, method={request.method}, "
+        f"url={url}, headers={safe_log_request(target_headers)}"
+    )
+    if request.method in ("POST", "PUT"):
+        logger.debug(f"Gateway upstream request body: {safe_log_request(converted_data)}")
 
     # 11. 转发请求
     try:
@@ -2245,6 +2321,11 @@ async def gateway_proxy(full_path: str, request: Request):
                             )
                             raise HTTPException(status_code=status, detail=error_msg)
 
+                        logger.info(f"Gateway streaming upstream response: status={response.status_code}")
+                        logger.debug(
+                            f"Gateway streaming upstream response headers: {safe_log_request(dict(response.headers))}"
+                        )
+
                         # 构造临时 channel 用于响应转换
                         temp_channel = ChannelInfo(
                             id="gateway",
@@ -2260,8 +2341,25 @@ async def gateway_proxy(full_path: str, request: Request):
                             created_at="",
                             updated_at="",
                         )
-                        async for chunk in handle_streaming_response(response, temp_channel, request_data, source_format):
-                            yield chunk
+                        chunk_count = 0
+                        total_bytes = 0
+                        started_at = time.time()
+                        try:
+                            async for chunk in handle_streaming_response(response, temp_channel, request_data, source_format):
+                                chunk_count += 1
+                                if isinstance(chunk, str):
+                                    total_bytes += len(chunk.encode("utf-8", errors="ignore"))
+                                elif isinstance(chunk, (bytes, bytearray)):
+                                    total_bytes += len(chunk)
+                                else:
+                                    total_bytes += len(str(chunk).encode("utf-8", errors="ignore"))
+                                yield chunk
+                        finally:
+                            duration_ms = int((time.time() - started_at) * 1000)
+                            logger.info(
+                                f"Gateway streaming output summary: status=200, chunks={chunk_count}, "
+                                f"bytes={total_bytes}, duration_ms={duration_ms}"
+                            )
 
             return StreamingResponse(
                 stream_generator(),
@@ -2282,9 +2380,15 @@ async def gateway_proxy(full_path: str, request: Request):
                     headers=target_headers,
                 )
 
+            logger.info(f"Gateway upstream response: status={response.status_code}")
+            logger.debug(
+                f"Gateway upstream response headers: {safe_log_request(dict(response.headers))}"
+            )
+
             if response.status_code != 200:
                 status = response.status_code
                 body_text = response.text
+                logger.debug(f"Gateway upstream error body: {safe_log_response({'body': body_text})}")
                 error_msg = _parse_upstream_error(config.provider, status, body_text)
 
                 # 根据状态码分类错误类型
@@ -2310,12 +2414,15 @@ async def gateway_proxy(full_path: str, request: Request):
                 raise HTTPException(status_code=status, detail=error_msg)
 
             response_data = response.json()
+            logger.debug(f"Gateway upstream response body: {safe_log_response(response_data)}")
 
             # 响应格式转换（仅对 POST / PUT 做格式转换）
             if has_body and source_format != config.provider:
                 response_result = convert_response(config.provider, source_format, response_data)
                 if response_result.success:
                     response_data = response_result.data
+
+            logger.debug(f"Gateway output response body: {safe_log_response(response_data)}")
 
             return JSONResponse(
                 content=response_data,
