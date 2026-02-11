@@ -63,6 +63,11 @@ class APIConverter {
                 this.updateChannelDefaultUrl(e.target.value);
             });
         }
+
+        const mappingImportInput = document.getElementById('model-mapping-import-file');
+        if (mappingImportInput) {
+            mappingImportInput.addEventListener('change', (e) => this.importModelMappingFromFile(e));
+        }
     }
 
     updateDefaultUrl(provider) {
@@ -520,6 +525,35 @@ class APIConverter {
         if (options.forceIfPresent) return mapping;
         // 用于创建：若没有有效条目则返回null以省略字段
         return Object.keys(mapping).length > 0 ? mapping : null;
+    }
+
+    triggerImportModelMapping() {
+        const input = document.getElementById('model-mapping-import-file');
+        if (!input) return;
+        input.value = '';
+        input.click();
+    }
+
+    async importModelMappingFromFile(event) {
+        const file = event.target?.files?.[0];
+        if (!file) return;
+        try {
+            const text = await file.text();
+            const parsed = JSON.parse(text);
+            const mapping = normalizeImportedModelMapping(parsed);
+            this.setMappingRows(mapping);
+            showToast(`模型映射导入成功，共 ${Object.keys(mapping).length} 条`, 'success');
+        } catch (error) {
+            showToast('导入失败：JSON 格式不正确（支持对象或数组）', 'error');
+        } finally {
+            event.target.value = '';
+        }
+    }
+
+    exportModelMapping() {
+        const mapping = this.collectModelMapping({ forceIfPresent: true }) || {};
+        downloadModelMappingJson(mapping, 'channel-model-mapping.json');
+        showToast(`模型映射已导出，共 ${Object.keys(mapping).length} 条`, 'success');
     }
 
     // 渠道管理方法
@@ -1484,6 +1518,65 @@ function showToast(message, type = 'info') {
     }
 }
 
+// ===== 模型映射导入/导出通用工具 =====
+function downloadModelMappingJson(mappingObj, filename = 'model-mapping.json') {
+    const safeObj = mappingObj && typeof mappingObj === 'object' ? mappingObj : {};
+    const blob = new Blob([JSON.stringify(safeObj, null, 2)], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+function normalizeImportedModelMapping(payload) {
+    // Accept:
+    // - {"from": "to", ...}
+    // - {"model_mapping": {...}} / {"models_mapping": {...}} / {"mapping": {...}}
+    // - [["from","to"], ...]
+    // - [{"from":"a","to":"b"}, ...]
+    let candidate = payload;
+    if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
+        if (candidate.model_mapping && typeof candidate.model_mapping === 'object') {
+            candidate = candidate.model_mapping;
+        } else if (candidate.models_mapping && typeof candidate.models_mapping === 'object') {
+            candidate = candidate.models_mapping;
+        } else if (candidate.mapping && typeof candidate.mapping === 'object') {
+            candidate = candidate.mapping;
+        }
+    }
+
+    const mapping = {};
+    if (Array.isArray(candidate)) {
+        candidate.forEach((item) => {
+            if (Array.isArray(item) && item.length >= 2) {
+                const from = (typeof item[0] === 'string' || typeof item[0] === 'number') ? String(item[0]).trim() : '';
+                const to = (typeof item[1] === 'string' || typeof item[1] === 'number') ? String(item[1]).trim() : '';
+                if (from && to) mapping[from] = to;
+            } else if (item && typeof item === 'object') {
+                const from = (typeof item.from === 'string' || typeof item.from === 'number') ? String(item.from).trim() : '';
+                const to = (typeof item.to === 'string' || typeof item.to === 'number') ? String(item.to).trim() : '';
+                if (from && to) mapping[from] = to;
+            }
+        });
+        return mapping;
+    }
+
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+        throw new Error('Invalid mapping format');
+    }
+
+    Object.entries(candidate).forEach(([k, v]) => {
+        const from = (typeof k === 'string' || typeof k === 'number') ? String(k).trim() : '';
+        const to = (typeof v === 'string' || typeof v === 'number') ? String(v).trim() : '';
+        if (from && to) mapping[from] = to;
+    });
+    return mapping;
+}
+
 
 // ============ Gateway 配置管理 ============
 
@@ -1516,12 +1609,8 @@ async function loadGatewayConfig() {
             document.getElementById('gateway_enabled').checked = data.config.enabled !== false;
 
             // 填充模型映射
-            const mappingContainer = document.getElementById('gateway-model-mapping-rows');
-            mappingContainer.innerHTML = '';
             const mapping = data.config.model_mapping || {};
-            Object.entries(mapping).forEach(([from, to]) => {
-                addGatewayMappingRow(from, to);
-            });
+            setGatewayMappingRows(mapping);
         } else {
             // 未配置
             statusBadge.textContent = '未配置';
@@ -1558,6 +1647,11 @@ function setupGatewayForm() {
             }
         });
     }
+
+    const mappingImportInput = document.getElementById('gateway-model-mapping-import-file');
+    if (mappingImportInput) {
+        mappingImportInput.addEventListener('change', importGatewayModelMappingFromFile);
+    }
 }
 
 // 保存 Gateway 配置
@@ -1566,15 +1660,7 @@ async function saveGatewayConfig() {
     const submitBtn = form.querySelector('button[type="submit"]');
 
     // 收集模型映射
-    const modelMapping = {};
-    const rows = document.querySelectorAll('#gateway-model-mapping-rows .mapping-row');
-    rows.forEach(row => {
-        const fromInput = row.querySelector('.mapping-from');
-        const toInput = row.querySelector('.mapping-to');
-        if (fromInput && toInput && fromInput.value.trim() && toInput.value.trim()) {
-            modelMapping[fromInput.value.trim()] = toInput.value.trim();
-        }
-    });
+    const modelMapping = collectGatewayModelMapping();
 
     const config = {
         provider: document.getElementById('gateway_provider').value,
@@ -1609,6 +1695,19 @@ async function saveGatewayConfig() {
         submitBtn.disabled = false;
         submitBtn.textContent = '保存配置';
     }
+}
+
+function collectGatewayModelMapping() {
+    const modelMapping = {};
+    const rows = document.querySelectorAll('#gateway-model-mapping-rows .mapping-row');
+    rows.forEach(row => {
+        const fromInput = row.querySelector('.mapping-from');
+        const toInput = row.querySelector('.mapping-to');
+        if (fromInput && toInput && fromInput.value.trim() && toInput.value.trim()) {
+            modelMapping[fromInput.value.trim()] = toInput.value.trim();
+        }
+    });
+    return modelMapping;
 }
 
 // 删除 Gateway 配置
@@ -1669,9 +1768,53 @@ function addGatewayMappingRow(fromValue = '', toValue = '') {
     container.appendChild(row);
 }
 
+function setGatewayMappingRows(mappingObj) {
+    const container = document.getElementById('gateway-model-mapping-rows');
+    if (!container) return;
+    container.innerHTML = '';
+    if (!mappingObj || typeof mappingObj !== 'object' || Object.keys(mappingObj).length === 0) {
+        addGatewayMappingRow();
+        return;
+    }
+    Object.entries(mappingObj).forEach(([from, to]) => {
+        addGatewayMappingRow(from, to);
+    });
+}
+
+function triggerGatewayImportModelMapping() {
+    const input = document.getElementById('gateway-model-mapping-import-file');
+    if (!input) return;
+    input.value = '';
+    input.click();
+}
+
+async function importGatewayModelMappingFromFile(event) {
+    const file = event.target?.files?.[0];
+    if (!file) return;
+    try {
+        const text = await file.text();
+        const parsed = JSON.parse(text);
+        const mapping = normalizeImportedModelMapping(parsed);
+        setGatewayMappingRows(mapping);
+        showToast(`Gateway 模型映射导入成功，共 ${Object.keys(mapping).length} 条`, 'success');
+    } catch (_) {
+        showToast('Gateway 模型映射导入失败：JSON 格式不正确（支持对象或数组）', 'error');
+    } finally {
+        event.target.value = '';
+    }
+}
+
+function exportGatewayModelMapping() {
+    const mapping = collectGatewayModelMapping();
+    downloadModelMappingJson(mapping, 'gateway-model-mapping.json');
+    showToast(`Gateway 模型映射已导出，共 ${Object.keys(mapping).length} 条`, 'success');
+}
+
 // 暴露 Gateway 函数到全局作用域（因脚本是动态加载的）
 window.addGatewayMappingRow = addGatewayMappingRow;
 window.deleteGatewayConfig = deleteGatewayConfig;
+window.exportGatewayModelMapping = exportGatewayModelMapping;
+window.triggerGatewayImportModelMapping = triggerGatewayImportModelMapping;
 
 // 脚本加载完成后立即初始化 Gateway 配置
 // 注意：由于脚本是动态加载的，DOMContentLoaded 已经触发过了

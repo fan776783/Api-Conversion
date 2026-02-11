@@ -383,6 +383,9 @@ async def dashboard(request: Request):
                             </div>
                             <div class="form-actions" style="margin-top: 8px;">
                                 <button type="button" class="btn-secondary" onclick="apiConverter.addMappingRow()">新增映射</button>
+                                <button type="button" class="btn-secondary" onclick="apiConverter.exportModelMapping()">导出</button>
+                                <button type="button" class="btn-secondary" onclick="apiConverter.triggerImportModelMapping()">导入</button>
+                                <input type="file" id="model-mapping-import-file" accept="application/json" style="display:none;" />
                             </div>
                         </div>
                         <button type="submit" class="btn-primary">添加渠道</button>
@@ -449,6 +452,9 @@ async def dashboard(request: Request):
                             </div>
                             <div class="form-actions" style="margin-top: 8px;">
                                 <button type="button" class="btn-secondary" onclick="addGatewayMappingRow()">新增映射</button>
+                                <button type="button" class="btn-secondary" onclick="exportGatewayModelMapping()">导出</button>
+                                <button type="button" class="btn-secondary" onclick="triggerGatewayImportModelMapping()">导入</button>
+                                <input type="file" id="gateway-model-mapping-import-file" accept="application/json" style="display:none;" />
                             </div>
                         </div>
                         <div class="form-actions" style="margin-top: 20px;">
