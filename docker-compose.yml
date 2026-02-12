@@ -3,11 +3,11 @@ version: "3.8"
 services:
   api:
     # 使用预构建镜像
-    image: ghcr.io/fan776783/api-conversion:latest
+    # image: ghcr.io/fan776783/api-conversion:latest
     # 本地构建
-    # build:
-    #   context: .
-    #   dockerfile: Dockerfile
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: api-conversion
     ports:
       - "8000:8000"
@@ -92,4 +92,3 @@ networks:
       config:
         - subnet: 172.29.50.0/24
           gateway: 172.29.50.1
-

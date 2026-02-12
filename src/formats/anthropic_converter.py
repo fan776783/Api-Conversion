@@ -829,36 +829,20 @@ class AnthropicConverter(BaseConverter):
         return ConversionResult(success=True, data=result_data)
     
     def _clean_json_fragment(self, fragment: str) -> str:
-        """清理JSON片段，避免不完整的Unicode字符或转义序列"""
+        # 清理JSON片段，保留完整的转义序列
+        #
+        # Anthropic 的 input_json_delta.partial_json 协议设计上允许不完整的
+        # JSON 片段，客户端会拼接所有片段后统一 json.loads 解析。
+        #
+        # 因此不应删除可能属于转义序列的反斜杠字符，
+        # 否则会导致转义序列被破坏（例如 JSON 中的换行转义变成字面 n）。
         if not fragment:
             return fragment
         
-        try:
-            # 移除开头和结尾可能不完整的Unicode字符
-            # 检查最后几个字符是否是不完整的转义序列
-            cleaned = fragment
-            
-            # 处理可能被截断的转义序列
-            if cleaned.endswith('\\') and not cleaned.endswith('\\\\'):
-                cleaned = cleaned[:-1]  # 移除悬挂的反斜杠
-            elif cleaned.endswith('\\u') or cleaned.endswith('\\u0') or cleaned.endswith('\\u00'):
-                # 不完整的Unicode转义序列
-                idx = cleaned.rfind('\\u')
-                cleaned = cleaned[:idx]
-            
-            # 验证清理后的片段不会导致JSON解析错误
-            if cleaned:
-                # 简单测试：如果片段包含引号，确保它们是平衡的
-                quote_count = cleaned.count('"') - cleaned.count('\\"')
-                if quote_count % 2 == 1:
-                    # 如果引号数量为奇数，可能在字符串中间被截断
-                    pass  # 仍然发送，让接收端处理
-            
-            return cleaned
-            
-        except Exception as e:
-            self.logger.warning(f"Error cleaning JSON fragment: {e}, returning original")
-            return fragment
+        # 直接返回原始片段，不做修改
+        # 任何截断情况（末尾反斜杠、不完整的 Unicode 转义）都由客户端
+        # 在拼接所有 partial_json 后统一处理
+        return fragment
     
     
     def _convert_from_gemini_streaming_chunk(self, data: Dict[str, Any]) -> ConversionResult:
