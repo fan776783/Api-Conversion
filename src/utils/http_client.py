@@ -15,7 +15,6 @@ logger = setup_logger("http_client")
 def create_proxy_config(channel_info: ChannelInfo) -> Optional[Dict[str, str]]:
     """从渠道信息创建代理配置"""
     if not getattr(channel_info, 'use_proxy', False):
-        logger.debug(f"Channel {channel_info.name}: Proxy disabled")
         return None
     
     proxy_host = getattr(channel_info, 'proxy_host', None)
@@ -73,7 +72,6 @@ def create_proxy_config(channel_info: ChannelInfo) -> Optional[Dict[str, str]]:
 def create_proxy_config_from_channel_config(channel_config: ChannelConfig) -> Optional[Dict[str, str]]:
     """从渠道配置创建代理配置"""
     if not getattr(channel_config, 'use_proxy', False):
-        logger.debug(f"Config for {channel_config.provider}: Proxy disabled")
         return None
     
     if not channel_config.proxy_host or not channel_config.proxy_port:
@@ -131,7 +129,7 @@ async def get_http_client(channel_info: ChannelInfo, timeout: float = 30.0):
         logger.info(f"Channel {channel_info.name}: Creating HTTP client with proxy")
         logger.debug(f"Channel {channel_info.name}: Proxy config keys: {list(proxy_config.keys())}")
     else:
-        logger.debug(f"Channel {channel_info.name}: Creating HTTP client without proxy")
+        pass
     
     proxy = next(iter(proxy_config.values())) if proxy_config else None
     async with httpx.AsyncClient(timeout=timeout, proxy=proxy) as client:
@@ -147,7 +145,7 @@ async def get_http_client_from_config(channel_config: ChannelConfig, timeout: fl
         logger.info(f"Config for {channel_config.provider}: Creating HTTP client with proxy")
         logger.debug(f"Config for {channel_config.provider}: Proxy config keys: {list(proxy_config.keys())}")
     else:
-        logger.debug(f"Config for {channel_config.provider}: Creating HTTP client without proxy")
+        pass
 
     proxy = next(iter(proxy_config.values())) if proxy_config else None
     async with httpx.AsyncClient(timeout=timeout, proxy=proxy) as client:

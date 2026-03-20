@@ -31,6 +31,8 @@ from src.utils.logger import (
 from src.utils.exceptions import ChannelNotFoundError, ConversionError, APIError, TimeoutError
 from src.utils.http_client import get_http_client
 from src.utils.env_config import env_config
+from src.utils.model_suffix import parse_model_suffix, apply_suffix_to_request
+from src.utils.payload_config import apply_payload_config
 from src.core.gateway_config import load_gateway_config
 from api.conversion_api import detect_request_format
 
@@ -367,8 +369,6 @@ def extract_openai_api_key(authorization: Optional[str] = Header(None)) -> str:
 
 def extract_anthropic_api_key(x_api_key: Optional[str] = Header(None, alias="x-api-key"), authorization: Optional[str] = Header(None, alias="authorization")) -> str:
     """从Anthropic格式的x-api-key header或Authorization header中提取API key"""
-    logger.debug(f"Anthropic auth - Received x-api-key header: {mask_api_key(x_api_key) if x_api_key else 'None'}")
-    logger.debug(f"Anthropic auth - Received authorization header: {mask_api_key(authorization) if authorization else 'None'}")
     
     # 首先尝试从x-api-key获取token
     if x_api_key:
@@ -424,6 +424,20 @@ async def forward_request_to_channel(
     headers: Optional[Dict[str, str]] = None
 ):
     """转发请求到目标渠道（统一处理流式和非流式）"""
+    # 0. 解析模型名后缀（thinking 配置 + token 限制）
+    # 注意：此处仅做解析和模型名替换，thinking/token 参数在格式转换后再注入（避免被转换器丢弃）
+    original_model = request_data.get("model", "")
+    suffix_result = parse_model_suffix(original_model)
+    if suffix_result.base_model != suffix_result.original_model:
+        request_data["model"] = suffix_result.base_model
+        logger.info(
+            f"模型名后缀解析: {suffix_result.original_model} → base_model={suffix_result.base_model}"
+        )
+    
+    # 0.5 应用渠道级 payload 配置（default/override）
+    if getattr(channel, 'payload_config', None):
+        request_data = apply_payload_config(request_data, channel.payload_config)
+    
     # 1. 检查是否为同格式透传 - 但对于Anthropic需要特殊处理图片排序
     if source_format == channel.provider:
         # 对于Anthropic格式，即使是透传也需要应用图片优先的最佳实践
@@ -464,22 +478,48 @@ async def forward_request_to_channel(
         if not conversion_result.success:
             raise ConversionError(f"Request conversion failed: {conversion_result.error}")
     
+    # 1.5 将后缀的 thinking/token 参数注入到转换后的数据中（使用目标格式）
+    if suffix_result.has_thinking_suffix or suffix_result.has_token_suffix:
+        if isinstance(conversion_result.data, dict):
+            apply_suffix_to_request(
+                conversion_result.data, suffix_result,
+                channel.provider, channel.provider
+            )
+
     # 在构建URL与发送前，按渠道配置应用模型映射（仅影响下游请求，不改变原始request_data，确保客户端看到原始模型名）
     mapped_model = None
     try:
         if channel.models_mapping and isinstance(request_data, dict):
-            original_model = request_data.get("model")
-            if original_model:
-                mapped_model = channel.models_mapping.get(original_model)
-                if mapped_model:
-                    logger.info(f"Applying model mapping for channel {channel.name}: {original_model} -> {mapped_model}")
-                    # 确保发送到下游的请求体中也使用映射后的模型
-                    if isinstance(conversion_result.data, dict):
-                        conversion_result.data = {**conversion_result.data, "model": mapped_model}
-                else:
-                    logger.debug(
-                        f"Model mapping not found for '{original_model}'. Available keys: {list(channel.models_mapping.keys())}"
+            # 优先用 base_model 查找映射（去除后缀后的名称），其次用原始模型名
+            base_model = suffix_result.base_model
+            original_req_model = request_data.get("model", base_model)
+            mapped_model = (
+                channel.models_mapping.get(original_req_model)
+                or channel.models_mapping.get(original_model)
+            )
+            if mapped_model:
+                logger.info(f"Applying model mapping for channel {channel.name}: {original_req_model} -> {mapped_model}")
+                # 对映射后的模型名也做后缀解析（映射值可能包含后缀，如 "gpt-5.4(high)"）
+                mapped_suffix = parse_model_suffix(mapped_model)
+                if mapped_suffix.has_thinking_suffix or mapped_suffix.has_token_suffix:
+                    logger.info(
+                        f"模型映射值包含后缀: {mapped_model} → base={mapped_suffix.base_model}, "
+                        f"thinking={mapped_suffix.thinking.mode}, max_tokens={mapped_suffix.max_tokens}"
                     )
+                    # 用干净的 base_model 替换映射值
+                    mapped_model = mapped_suffix.base_model
+                    # 将映射值中的后缀配置应用到转换后的数据中
+                    if isinstance(conversion_result.data, dict):
+                        apply_suffix_to_request(
+                            conversion_result.data, mapped_suffix,
+                            channel.provider, channel.provider
+                        )
+                if isinstance(conversion_result.data, dict):
+                    conversion_result.data["model"] = mapped_model
+            else:
+                logger.debug(
+                    f"Model mapping not found for '{original_req_model}'. Available keys: {list(channel.models_mapping.keys())}"
+                )
     except Exception as e:
         logger.warning(f"Failed to apply model mapping: {e}")
 
@@ -518,10 +558,26 @@ async def forward_request_to_channel(
         f"mapped_model={mapped_model or request_data.get('model')}"
     )
 
+    # 打印发送到上游的 thinking/token 关键参数（可观测性）
+    if isinstance(conversion_result.data, dict):
+        _upstream_params = {}
+        for _k in (
+            "reasoning_effort", "max_tokens", "max_completion_tokens",
+            "thinking", "generationConfig",
+        ):
+            if _k in conversion_result.data:
+                _upstream_params[_k] = conversion_result.data[_k]
+        if _upstream_params:
+            logger.info(f"🧠 上游 thinking/token 参数: {_upstream_params}")
+
     # 3. 统一请求处理
     try:
         logger.debug(f"Sending {'streaming' if is_streaming else 'non-streaming'} request to {channel.provider}: {url}")
-        logger.debug(f"Request data: {safe_log_request(conversion_result.data)}")
+        # 只打印关键参数，跳过 messages 内容（太长）
+        if isinstance(conversion_result.data, dict):
+            _req_summary = {k: v for k, v in conversion_result.data.items() if k != 'messages'}
+            _req_summary['messages_count'] = len(conversion_result.data.get('messages', []))
+            logger.debug(f"Request params: {json.dumps(_req_summary, ensure_ascii=False, default=str)}")
         
         # 检查渠道是否配置了代理
         if getattr(channel, 'use_proxy', False):
@@ -640,14 +696,11 @@ async def forward_request_to_channel(
 async def handle_streaming_response(response, channel, request_data, source_format):
     """处理流式响应"""
     logger.info(f"STREAMING RESPONSE: channel.provider='{channel.provider}', source_format='{source_format}', status={response.status_code}")
-    logger.debug(f"Received streaming response from {channel.provider}: status={response.status_code}")
     
     if response.status_code == 200:
         # 为当前请求流初始化独立的 converter 上下文，避免并发状态串扰
         clear_stream_converters()
 
-        # 流式处理响应
-        logger.debug("Starting to process streaming response")
         chunk_count = 0
         sent_end_marker = False
         
@@ -791,11 +844,8 @@ async def handle_streaming_response(response, channel, request_data, source_form
                 # 如果有内容，转换并发送内容chunk（不管是否也是结束chunk）
                 if has_content:
                     original_model = request_data.get("model")
-                    # Fix parameter order: source_format=provider, target_format=client_format
-                    logger.debug(f"Calling convert_streaming_chunk: source={channel.provider}, target={source_format}")
                     try:
                         response_conversion = convert_streaming_chunk(channel.provider, source_format, chunk_data, original_model)
-                        logger.debug(f"Content chunk conversion result: success={response_conversion.success if response_conversion else 'None'}")
                     except Exception as e:
                         logger.error(f"Error in convert_streaming_chunk for content chunk: {e}")
                         logger.error(f"Parameters: provider={channel.provider}, source={source_format}, chunk={chunk_data}")
@@ -845,19 +895,26 @@ async def handle_streaming_response(response, channel, request_data, source_form
                 # 检查是否是结束chunk（各种格式的结束标记）
                 # 注意：如果chunk既有内容又是结束，避免重复处理（内容处理时已经处理了结束逻辑）
                 if is_finish_chunk:
-                    if has_content:
-                        logger.debug(f"Stream ending with content+finish chunk - already processed by content handler")
-                    else:
-                        logger.debug(f"Stream ending with finish-only chunk: {chunk_data}")
+                    # 提取 usage 信息（如有），用于验证 thinking/token 参数是否生效
+                    if isinstance(chunk_data, dict):
+                        _usage = chunk_data.get("usage")
+                        if _usage:
+                            _usage_log = {
+                                "prompt_tokens": _usage.get("prompt_tokens"),
+                                "completion_tokens": _usage.get("completion_tokens"),
+                                "total_tokens": _usage.get("total_tokens"),
+                            }
+                            # OpenAI 推理模型会返回 reasoning_tokens
+                            _details = _usage.get("completion_tokens_details", {})
+                            if _details:
+                                _usage_log["reasoning_tokens"] = _details.get("reasoning_tokens")
+                            logger.info(f"📊 上游响应 usage: {_usage_log}")
                 
                 if is_finish_chunk and not has_content:
-                    # 转换并发送结束chunk（可能包含最后的内容和结束事件）
+                    # 转换并发送结束chunk
                     original_model = request_data.get("model")
-                    # Fix parameter order for finish event conversion as well
-                    logger.debug(f"Calling convert_streaming_chunk for finish: source={channel.provider}, target={source_format}")
                     try:
                         response_conversion = convert_streaming_chunk(channel.provider, source_format, chunk_data, original_model)
-                        logger.debug(f"Finish chunk conversion result: success={response_conversion.success if response_conversion else 'None'}")
                     except Exception as e:
                         logger.error(f"Error in convert_streaming_chunk for finish chunk: {e}")
                         logger.error(f"Parameters: provider={channel.provider}, source={source_format}, chunk={chunk_data}")
@@ -1396,8 +1453,6 @@ async def handle_unified_request(request, api_key: str, source_format: str):
         # 5. 根据流式参数选择处理方式
         
         if is_streaming:
-            # 流式请求
-            logger.debug("Processing streaming request")
             stream_generator = await forward_request_to_channel(
                 channel=channel,
                 request_data=request_data,
@@ -2101,6 +2156,19 @@ async def gateway_proxy(full_path: str, request: Request):
     if request.method in ("POST", "PUT"):
         if not isinstance(request_data, dict):
             raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+
+        # 5.0 解析模型名后缀（thinking 配置 + token 限制）
+        raw_model = request_data.get("model", "")
+        if raw_model:
+            gw_suffix_result = parse_model_suffix(raw_model)
+            if gw_suffix_result.has_thinking_suffix or gw_suffix_result.has_token_suffix:
+                request_data = apply_suffix_to_request(
+                    request_data, gw_suffix_result, source_format, config.provider
+                )
+                logger.info(
+                    f"Gateway 模型后缀解析: {raw_model} → base={gw_suffix_result.base_model}, "
+                    f"thinking={gw_suffix_result.thinking.mode}, max_tokens={gw_suffix_result.max_tokens}"
+                )
 
         model = request_data.get("model")
         if not model and source_format != "gemini":

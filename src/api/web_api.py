@@ -15,7 +15,7 @@ from core.openai_detector import OpenAICapabilityDetector
 from core.anthropic_detector import AnthropicCapabilityDetector
 from core.gemini_detector import GeminiCapabilityDetector
 from src.utils.config import ConfigManager, ChannelConfig
-from src.utils.logger import setup_logger
+from src.utils.logger import setup_logger, set_runtime_log_level, get_runtime_log_level
 from src.utils.auth import auth_manager
 from src.utils.security import mask_api_key
 from api.conversion_api import router as conversion_router
@@ -249,6 +249,12 @@ async def dashboard(request: Request):
             <div class="header-bar">
                 <h1>AI API FORMAT CONVERSION</h1>
                 <div class="header-actions">
+                    <select id="logLevelSelect" onchange="changeLogLevel(this.value)" title="运行时日志级别" style="padding: 6px 10px; border-radius: 8px; border: 1px solid rgba(0,0,0,0.1); background: rgba(255,255,255,0.8); font-size: 13px; cursor: pointer; min-width: 90px;">
+                        <option value="DEBUG">DEBUG</option>
+                        <option value="INFO">INFO</option>
+                        <option value="WARNING">WARNING</option>
+                        <option value="ERROR">ERROR</option>
+                    </select>
                     <button onclick="showChangePasswordModal()" class="btn-tertiary">修改密码</button>
                     <button onclick="logout()" class="btn-secondary">注销</button>
                 </div>
@@ -771,9 +777,40 @@ async def dashboard(request: Request):
                 }
             }
 
+            // 日志级别控制
+            async function changeLogLevel(level) {
+                try {
+                    const response = await fetch('/api/log-level', {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ level })
+                    });
+                    const data = await response.json();
+                    if (data.success) {
+                        console.log('日志级别已切换为:', level);
+                    }
+                } catch (error) {
+                    console.error('切换日志级别失败:', error);
+                }
+            }
+
+            async function loadLogLevel() {
+                try {
+                    const response = await fetch('/api/log-level');
+                    const data = await response.json();
+                    if (data.success) {
+                        const select = document.getElementById('logLevelSelect');
+                        if (select) select.value = data.level;
+                    }
+                } catch (error) {
+                    console.error('获取日志级别失败:', error);
+                }
+            }
+
             // 页面加载时初始化
             document.addEventListener('DOMContentLoaded', function() {
                 console.log('Dashboard loaded, user authenticated by server');
+                loadLogLevel();
 
                 console.log('Token exists, loading script.js...');
                 // 认证成功，加载主要功能脚本
@@ -950,6 +987,25 @@ async def get_providers():
 # 注意：删除渠道API已统一到 conversion_api.py 中
 # 原本此处的 @app.delete("/api/channels/{channel_id}") 端点与 conversion_api.py 重复
 # 为避免路由冲突，已移除。前端请求会自动使用 conversion_api.py 中的端点
+
+# 运行时日志级别控制 API
+@app.get("/api/log-level")
+async def get_log_level(_: bool = Depends(get_session_user)):
+    """获取当前日志级别"""
+    return {"success": True, "level": get_runtime_log_level()}
+
+
+@app.put("/api/log-level")
+async def set_log_level(request: dict, _: bool = Depends(get_session_user)):
+    """运行时切换日志级别"""
+    level = request.get("level", "").strip().upper()
+    if not level:
+        raise HTTPException(status_code=400, detail="缺少 level 参数")
+    try:
+        set_runtime_log_level(level)
+        return {"success": True, "level": level, "message": f"日志级别已切换为 {level}"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/api/capabilities")

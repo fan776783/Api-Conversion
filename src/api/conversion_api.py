@@ -47,6 +47,7 @@ class ChannelCreateRequest(BaseModel):
     max_retries: int = Field(3, description="最大重试次数")
     # 新增：模型映射（请求模型名 -> 映射模型名）
     models_mapping: Optional[Dict[str, str]] = None
+    payload_config: Optional[Dict[str, Any]] = None
     use_proxy: Optional[bool] = None
     proxy_type: Optional[str] = None
     proxy_host: Optional[str] = None
@@ -65,6 +66,7 @@ class ChannelUpdateRequest(BaseModel):
     max_retries: Optional[int] = None
     enabled: Optional[bool] = None
     models_mapping: Optional[Dict[str, str]] = None
+    payload_config: Optional[Dict[str, Any]] = None
     use_proxy: Optional[bool] = None
     proxy_type: Optional[str] = None
     proxy_host: Optional[str] = None
@@ -231,6 +233,7 @@ async def create_channel(request: ChannelCreateRequest, _: bool = Depends(get_se
             timeout=request.timeout,
             max_retries=request.max_retries,
             models_mapping=request.models_mapping,
+            payload_config=request.payload_config,
             use_proxy=request.use_proxy,
             proxy_type=request.proxy_type,
             proxy_host=request.proxy_host,
@@ -268,6 +271,7 @@ async def list_channels(_: bool = Depends(get_session_user)):
                     "max_retries": getattr(channel, 'max_retries', 3),
                     "enabled": channel.enabled,
                     "models_mapping": getattr(channel, 'models_mapping', None),
+                    "payload_config": getattr(channel, 'payload_config', None),
                     # 代理配置
                     "proxy_host": getattr(channel, 'proxy_host', None),
                     "proxy_port": getattr(channel, 'proxy_port', None),
@@ -307,6 +311,7 @@ async def get_channel(channel_id: str, _: bool = Depends(get_session_user)):
                 "max_retries": getattr(channel, 'max_retries', 3),
                 "enabled": channel.enabled,
                 "models_mapping": getattr(channel, 'models_mapping', None),
+                "payload_config": getattr(channel, 'payload_config', None),
                 # 代理配置
                 "proxy_host": getattr(channel, 'proxy_host', None),
                 "proxy_port": getattr(channel, 'proxy_port', None),
@@ -339,6 +344,7 @@ async def update_channel(channel_id: str, request: ChannelUpdateRequest, _: bool
             max_retries=request.max_retries,
             enabled=request.enabled,
             models_mapping=request.models_mapping,
+            payload_config=request.payload_config,
             use_proxy=request.use_proxy,
             proxy_type=request.proxy_type,
             proxy_host=request.proxy_host,

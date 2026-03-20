@@ -171,6 +171,45 @@ def _reconfigure_logger_handlers(logger: logging.Logger) -> None:
         elif role == "file":
             h.setLevel(_lvl(file_level))
 
+# 运行时日志级别覆盖（None 表示使用环境配置的默认级别）
+_runtime_log_level: Optional[str] = None
+
+
+def set_runtime_log_level(level: str) -> None:
+    """
+    运行时切换所有 logger 的日志级别（无需重启）。
+    设为 None 或空字符串则恢复为环境配置的默认级别。
+    """
+    global _runtime_log_level
+    valid_levels = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+    level_upper = level.upper() if level else None
+
+    if level_upper and level_upper not in valid_levels:
+        raise ValueError(f"无效的日志级别: {level}，支持: {', '.join(valid_levels)}")
+
+    _runtime_log_level = level_upper
+    log_level = logging.getLevelName(level_upper) if level_upper else logging.INFO
+
+    # 更新所有已创建的 logger 及其 handler
+    for logger in _loggers.values():
+        logger.setLevel(log_level)
+        for handler in logger.handlers:
+            handler.setLevel(log_level)
+
+    # 用 print 而不是 logger 避免循环
+    print(f"[logger] 运行时日志级别已切换为: {level_upper or '默认'}")
+
+
+def get_runtime_log_level() -> str:
+    """获取当前运行时日志级别（如果有运行时覆盖则返回覆盖值，否则返回环境配置值）"""
+    if _runtime_log_level:
+        return _runtime_log_level
+    try:
+        from src.utils.env_config import env_config
+        return env_config.log_level.upper()
+    except Exception:
+        return "WARNING"
+
 
 def get_logger(name: str) -> logging.Logger:
     """获取日志器"""

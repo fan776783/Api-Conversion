@@ -80,7 +80,7 @@ class EnvConfig:
     @property
     def web_port(self) -> int:
         """Web服务器端口"""
-        return self.get_int("WEB_PORT", 3000)
+        return self.get_int("WEB_PORT", 3500)
     
     # ================================
     # AI服务商配置

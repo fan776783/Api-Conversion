@@ -243,7 +243,7 @@ def convert_streaming_chunk(source_format: str, target_format: str, data: dict, 
         logger.debug(f"Calling reset_streaming_state() on {converter.__class__.__name__}")
         converter.reset_streaming_state()
     else:
-        logger.debug(f"Skipping state reset for {converter.__class__.__name__}")
+        pass  # 非首次chunk无需重置状态
     
     # 根据源格式和目标格式选择相应的流式转换方法
     if target_format == "openai":
@@ -253,10 +253,8 @@ def convert_streaming_chunk(source_format: str, target_format: str, data: dict, 
             return converter._convert_from_anthropic_streaming_chunk(data)
     elif target_format == "anthropic":
         if source_format == "openai" and hasattr(converter, '_convert_from_openai_streaming_chunk'):
-            logger.debug(f"Calling _convert_from_openai_streaming_chunk for {source_format} -> {target_format}")
             return converter._convert_from_openai_streaming_chunk(data)
         elif source_format == "gemini" and hasattr(converter, '_convert_from_gemini_streaming_chunk'):
-            logger.debug(f"Calling _convert_from_gemini_streaming_chunk for {source_format} -> {target_format}")
             return converter._convert_from_gemini_streaming_chunk(data)
     elif target_format == "gemini":
         if source_format == "openai" and hasattr(converter, '_convert_from_openai_streaming_chunk'):

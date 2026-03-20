@@ -825,7 +825,6 @@ class AnthropicConverter(BaseConverter):
             return ConversionResult(success=True, data="")
 
         result_data = "".join(events)
-        self.logger.debug(f"Generated {len(events)} events, total data length: {len(result_data)}")
         return ConversionResult(success=True, data=result_data)
     
     def _clean_json_fragment(self, fragment: str) -> str:

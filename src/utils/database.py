@@ -164,6 +164,7 @@ class DatabaseManager:
                         proxy_port INTEGER,
                         proxy_username TEXT,
                         proxy_password TEXT,
+                        payload_config TEXT,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL
                     )
@@ -198,6 +199,7 @@ class DatabaseManager:
                         proxy_port INT,
                         proxy_username VARCHAR(255),
                         proxy_password TEXT,
+                        payload_config TEXT,
                         created_at DATETIME NOT NULL,
                         updated_at DATETIME NOT NULL
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
@@ -216,6 +218,9 @@ class DatabaseManager:
             
             # 进行数据库迁移 - 添加代理字段（如果不存在）
             self._migrate_proxy_fields(cursor, conn)
+            
+            # 进行数据库迁移 - 添加 payload_config 字段（如果不存在）
+            self._migrate_payload_config_field(cursor, conn)
             
             logger.info(f"Database ({self.db_type}) initialized successfully")
         finally:
@@ -263,6 +268,25 @@ class DatabaseManager:
         except Exception as e:
             logger.warning(f"Migration warning (proxy fields may already exist): {e}")
     
+    def _migrate_payload_config_field(self, cursor, conn):
+        """迁移数据库，添加 payload_config 字段（如果不存在）"""
+        try:
+            if self.db_type == "sqlite":
+                cursor.execute("PRAGMA table_info(channels)")
+                columns = [row[1] for row in cursor.fetchall()]
+                if 'payload_config' not in columns:
+                    cursor.execute("ALTER TABLE channels ADD COLUMN payload_config TEXT")
+                    logger.info("Added column payload_config to channels table")
+            elif self.db_type == "mysql":
+                cursor.execute("SHOW COLUMNS FROM channels")
+                columns = [row['Field'] for row in cursor.fetchall()]
+                if 'payload_config' not in columns:
+                    cursor.execute("ALTER TABLE channels ADD COLUMN payload_config TEXT")
+                    logger.info("Added column payload_config to channels table")
+            conn.commit()
+        except Exception as e:
+            logger.warning(f"Migration warning (payload_config field may already exist): {e}")
+    
     def add_channel(
         self,
         name: str,
@@ -273,6 +297,7 @@ class DatabaseManager:
         timeout: int = 30,
         max_retries: int = 3,
         models_mapping: Optional[Dict[str, str]] = None,
+        payload_config: Optional[Dict[str, Any]] = None,
         use_proxy: bool = False,
         proxy_type: Optional[str] = None,
         proxy_host: Optional[str] = None,
@@ -285,6 +310,7 @@ class DatabaseManager:
         now = datetime.now().isoformat()
         
         models_mapping_json = json.dumps(models_mapping) if models_mapping else None
+        payload_config_json = json.dumps(payload_config) if payload_config else None
         
         # 验证API密钥不是明显的JavaScript错误信息
         if api_key.startswith('script.js:') or 'Uncaught TypeError' in api_key:
@@ -304,12 +330,12 @@ class DatabaseManager:
                 cursor = self._execute_query(conn, '''
                     INSERT INTO channels 
                     (id, name, provider, base_url, api_key, custom_key, timeout, max_retries, 
-                     enabled, models_mapping, use_proxy, proxy_type, proxy_host, proxy_port, 
+                     enabled, models_mapping, payload_config, use_proxy, proxy_type, proxy_host, proxy_port, 
                      proxy_username, proxy_password, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     channel_id, name, provider, base_url, encrypted_api_key, custom_key,
-                    timeout, max_retries, True, models_mapping_json, use_proxy, proxy_type,
+                    timeout, max_retries, True, models_mapping_json, payload_config_json, use_proxy, proxy_type,
                     proxy_host, proxy_port, proxy_username, encrypted_proxy_password, now, now
                 ))
                 
@@ -332,6 +358,7 @@ class DatabaseManager:
         max_retries: Optional[int] = None,
         enabled: Optional[bool] = None,
         models_mapping: Optional[Dict[str, str]] = None,
+        payload_config: Optional[Dict[str, Any]] = None,
         use_proxy: Optional[bool] = None,
         proxy_type: Optional[str] = None,
         proxy_host: Optional[str] = None,
@@ -374,6 +401,9 @@ class DatabaseManager:
         if models_mapping is not None:
             updates.append("models_mapping = ?")
             params.append(json.dumps(models_mapping))
+        if payload_config is not None:
+            updates.append("payload_config = ?")
+            params.append(json.dumps(payload_config))
         if use_proxy is not None:
             updates.append("use_proxy = ?")
             params.append(use_proxy)
@@ -442,6 +472,8 @@ class DatabaseManager:
                 channel = dict(row)
                 if channel['models_mapping']:
                     channel['models_mapping'] = json.loads(channel['models_mapping'])
+                if channel.get('payload_config'):
+                    channel['payload_config'] = json.loads(channel['payload_config'])
                 # 解密API密钥
                 if channel['api_key']:
                     channel['api_key'] = encryption_manager.decrypt_api_key(channel['api_key'])
@@ -464,6 +496,8 @@ class DatabaseManager:
                 channel = dict(row)
                 if channel['models_mapping']:
                     channel['models_mapping'] = json.loads(channel['models_mapping'])
+                if channel.get('payload_config'):
+                    channel['payload_config'] = json.loads(channel['payload_config'])
                 # 解密API密钥
                 if channel['api_key']:
                     channel['api_key'] = encryption_manager.decrypt_api_key(channel['api_key'])
@@ -482,6 +516,8 @@ class DatabaseManager:
                 channel = dict(row)
                 if channel['models_mapping']:
                     channel['models_mapping'] = json.loads(channel['models_mapping'])
+                if channel.get('payload_config'):
+                    channel['payload_config'] = json.loads(channel['payload_config'])
                 # 解密API密钥
                 if channel['api_key']:
                     channel['api_key'] = encryption_manager.decrypt_api_key(channel['api_key'])
@@ -500,6 +536,8 @@ class DatabaseManager:
                 channel = dict(row)
                 if channel['models_mapping']:
                     channel['models_mapping'] = json.loads(channel['models_mapping'])
+                if channel.get('payload_config'):
+                    channel['payload_config'] = json.loads(channel['payload_config'])
                 # 解密API密钥
                 if channel['api_key']:
                     channel['api_key'] = encryption_manager.decrypt_api_key(channel['api_key'])
@@ -521,6 +559,8 @@ class DatabaseManager:
                 channel = dict(row)
                 if channel['models_mapping']:
                     channel['models_mapping'] = json.loads(channel['models_mapping'])
+                if channel.get('payload_config'):
+                    channel['payload_config'] = json.loads(channel['payload_config'])
                 # 解密API密钥
                 if channel['api_key']:
                     channel['api_key'] = encryption_manager.decrypt_api_key(channel['api_key'])
