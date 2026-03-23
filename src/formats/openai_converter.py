@@ -6,6 +6,8 @@ from typing import Dict, Any, Optional, List
 import json
 import copy
 
+from src.utils.logger import log_diagnose_event
+
 from .base_converter import BaseConverter, ConversionResult, ConversionError
 
 
@@ -207,7 +209,7 @@ class OpenAIConverter(BaseConverter):
         # 处理思考预算转换 (OpenAI max_completion_tokens + reasoning_effort -> Anthropic thinkingBudget)
         # 通过max_completion_tokens判断是否为思考模式
         if "max_completion_tokens" in data:
-            self.logger.info(f"🧠 [THINKING BUDGET] 检测到OpenAI max_completion_tokens参数，启用思考模式")
+            log_diagnose_event(self.logger, "OpenAI max_completion_tokens detected, enabling Anthropic thinking")
             
             # 确定reasoning_effort：如果没传则默认为medium
             reasoning_effort = data.get("reasoning_effort", "medium")
@@ -422,7 +424,7 @@ class OpenAIConverter(BaseConverter):
         # 处理思考预算转换 (OpenAI max_completion_tokens + reasoning_effort -> Gemini thinkingBudget)
         # 通过max_completion_tokens判断是否为思考模式
         if "max_completion_tokens" in data:
-            self.logger.info(f"🧠 [THINKING BUDGET] 检测到OpenAI max_completion_tokens参数，启用思考模式")
+            log_diagnose_event(self.logger, "OpenAI max_completion_tokens detected, enabling Anthropic thinking")
             
             # 确定reasoning_effort：如果没传则默认为medium
             reasoning_effort = data.get("reasoning_effort", "medium")

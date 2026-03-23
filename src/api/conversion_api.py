@@ -5,6 +5,7 @@
 import asyncio
 import json
 import time
+import logging
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 import httpx
@@ -15,8 +16,16 @@ from pydantic import BaseModel, Field
 from channels.channel_manager import channel_manager, ChannelInfo
 from formats.converter_factory import ConverterFactory, convert_request, convert_response
 from src.utils.logger import (
-    setup_logger, log_structured_error,
-    ERROR_TYPE_NETWORK, ERROR_TYPE_AUTH, ERROR_TYPE_RATE_LIMIT, ERROR_TYPE_UPSTREAM_API
+    setup_logger,
+    log_observe_request_done,
+    log_observe_request_failed,
+    sanitize_url_for_log,
+    log_diagnose_event,
+    log_structured_error,
+    ERROR_TYPE_NETWORK,
+    ERROR_TYPE_AUTH,
+    ERROR_TYPE_RATE_LIMIT,
+    ERROR_TYPE_UPSTREAM_API,
 )
 from src.utils.exceptions import ChannelNotFoundError, ConversionError, APIError, TimeoutError
 from src.utils.http_client import get_http_client
@@ -25,6 +34,17 @@ from src.core.gateway_config import (
 )
 
 logger = setup_logger("conversion_api")
+
+
+def _safe_json_dumps(payload: Any) -> str:
+    try:
+        return json.dumps(payload, ensure_ascii=False, default=str)
+    except Exception:
+        return str(payload)
+
+
+def _count_payload_chars(payload: Any) -> int:
+    return len(_safe_json_dumps(payload)) if payload is not None else 0
 
 router = APIRouter()
 
@@ -113,14 +133,20 @@ async def forward_request(
             original_model = converted_data.get("model")
             mapped = channel.models_mapping.get(original_model)
             if mapped:
-                logger.info(f"Applying model mapping for channel {channel.name}: {original_model} -> {mapped}")
+                log_diagnose_event(
+                    logger,
+                    "Applying model mapping",
+                    extra={"channel": channel.name, "from": original_model, "to": mapped},
+                )
                 converted_data = {**converted_data, "model": mapped}
             else:
-                logger.debug(
-                    f"Model mapping not found for '{original_model}'. Available keys: {list(channel.models_mapping.keys())}"
+                log_diagnose_event(
+                    logger,
+                    "Model mapping not found",
+                    extra={"model": original_model, "available": list(channel.models_mapping.keys())},
                 )
     except Exception as e:
-        logger.warning(f"Failed to apply model mapping: {e}")
+        log_diagnose_event(logger, "Failed to apply model mapping", extra={"error": str(e)}, level=logging.WARNING)
     # 构建请求URL
     if channel.provider == "openai":
         url = f"{channel.base_url.rstrip('/')}/chat/completions"
@@ -425,17 +451,27 @@ async def gemini_generate_content(request: Request):
 
 async def handle_conversion_request(request: Request, target_format: str):
     """处理转换请求的通用逻辑"""
+    request_started_at = time.perf_counter()
+    request_headers = dict(request.headers)
+    request_id = request.headers.get("x-request-id") or request.headers.get("x-correlation-id") or f"conv-{int(time.time() * 1000)}"
     try:
         # 获取请求数据
         request_data = await request.json()
-        headers = dict(request.headers)
-        
+        headers = dict(request_headers)
+        input_chars = _count_payload_chars(request_data)
+
         # 检测源格式
         source_format = await detect_request_format(request_data, str(request.url.path))
-        
-        logger.info(f"Request URL path: {request.url.path}")
-        logger.info(f"Detected source_format: {source_format}, target_format: {target_format}")
-        logger.info(f"Converting request from {source_format} to {target_format}")
+
+        log_diagnose_event(
+            logger,
+            "Conversion request context",
+            extra={
+                "path": request.url.path,
+                "source_format": source_format,
+                "target_format": target_format,
+            },
+        )
         
         # 如果源格式和目标格式相同，直接转发
         if source_format == target_format:
@@ -452,6 +488,24 @@ async def handle_conversion_request(request: Request, target_format: str):
             
             # 直接转发请求
             response_data = await forward_request(channel, request_data, headers)
+            log_observe_request_done(
+                logger,
+                request_id=request_id,
+                source_format=source_format,
+                request_method=request.method,
+                request_path=request.url.path,
+                channel_name=channel.name,
+                channel_provider=channel.provider,
+                upstream_url=sanitize_url_for_log(channel.base_url),
+                client_model=request_data.get("model"),
+                upstream_model=request_data.get("model"),
+                is_streaming=False,
+                status_code=200,
+                duration_ms=round((time.perf_counter() - request_started_at) * 1000, 2),
+                input_chars=input_chars,
+                output_chars=_count_payload_chars(response_data),
+                note="conversion_passthrough",
+            )
             return response_data
         
         # 格式转换
@@ -476,20 +530,91 @@ async def handle_conversion_request(request: Request, target_format: str):
         
         # 转发请求
         response_data = await forward_request(channel, conversion_result.data, headers)
-        
+
         # 转换响应格式
         response_conversion_result = convert_response(source_format, target_format, response_data)
-        
+
         if not response_conversion_result.success:
             logger.warning(f"Response conversion failed: {response_conversion_result.error}")
-            # 如果响应转换失败，返回原始响应
+            log_observe_request_done(
+                logger,
+                request_id=request_id,
+                source_format=source_format,
+                request_method=request.method,
+                request_path=request.url.path,
+                channel_name=channel.name,
+                channel_provider=channel.provider,
+                upstream_url=sanitize_url_for_log(channel.base_url),
+                client_model=request_data.get("model"),
+                upstream_model=conversion_result.data.get("model") if isinstance(conversion_result.data, dict) else request_data.get("model"),
+                is_streaming=False,
+                status_code=200,
+                duration_ms=round((time.perf_counter() - request_started_at) * 1000, 2),
+                input_chars=input_chars,
+                output_chars=_count_payload_chars(response_data),
+                note="conversion_response_passthrough",
+            )
             return response_data
-        
+
+        log_observe_request_done(
+            logger,
+            request_id=request_id,
+            source_format=source_format,
+            request_method=request.method,
+            request_path=request.url.path,
+            channel_name=channel.name,
+            channel_provider=channel.provider,
+            upstream_url=sanitize_url_for_log(channel.base_url),
+            client_model=request_data.get("model"),
+            upstream_model=conversion_result.data.get("model") if isinstance(conversion_result.data, dict) else request_data.get("model"),
+            is_streaming=False,
+            status_code=200,
+            duration_ms=round((time.perf_counter() - request_started_at) * 1000, 2),
+            input_chars=input_chars,
+            output_chars=_count_payload_chars(response_conversion_result.data),
+            note="conversion_response_converted",
+        )
         return response_conversion_result.data
         
-    except HTTPException:
+    except HTTPException as e:
+        log_observe_request_failed(
+            logger,
+            request_id=request_id,
+            source_format=locals().get("source_format"),
+            request_method=request.method,
+            request_path=request.url.path,
+            channel_name=locals().get("channel").name if locals().get("channel") else None,
+            channel_provider=locals().get("channel").provider if locals().get("channel") else None,
+            upstream_url=sanitize_url_for_log(locals().get("channel").base_url) if locals().get("channel") else None,
+            client_model=locals().get("request_data", {}).get("model") if isinstance(locals().get("request_data"), dict) else None,
+            upstream_model=locals().get("conversion_result").data.get("model") if locals().get("conversion_result") and isinstance(locals().get("conversion_result").data, dict) else None,
+            is_streaming=False,
+            status_code=e.status_code,
+            duration_ms=round((time.perf_counter() - request_started_at) * 1000, 2),
+            error_type="conversion_request",
+            stage="handle_conversion_request",
+            message=str(e.detail),
+        )
         raise
     except Exception as e:
+        log_observe_request_failed(
+            logger,
+            request_id=request_id,
+            source_format=locals().get("source_format"),
+            request_method=request.method,
+            request_path=request.url.path,
+            channel_name=locals().get("channel").name if locals().get("channel") else None,
+            channel_provider=locals().get("channel").provider if locals().get("channel") else None,
+            upstream_url=sanitize_url_for_log(locals().get("channel").base_url) if locals().get("channel") else None,
+            client_model=locals().get("request_data", {}).get("model") if isinstance(locals().get("request_data"), dict) else None,
+            upstream_model=locals().get("conversion_result").data.get("model") if locals().get("conversion_result") and isinstance(locals().get("conversion_result").data, dict) else None,
+            is_streaming=False,
+            status_code=500,
+            duration_ms=round((time.perf_counter() - request_started_at) * 1000, 2),
+            error_type="conversion_request",
+            stage="handle_conversion_request",
+            message=str(e),
+        )
         logger.error(f"Conversion request failed: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
 

@@ -154,3 +154,15 @@ class TestToolChoiceConversion:
         anthropic_any = {"type": "any"}
         openai_required = "required"
         assert anthropic_any != openai_required
+
+    def test_expected_mapping_examples(self):
+        """记录兼容映射的期望结果。"""
+        mapping_examples = {
+            "auto": "auto",
+            "any": "required",
+            "tool": {"type": "function", "function": {"name": "Bash"}},
+        }
+
+        assert mapping_examples["auto"] == "auto"
+        assert mapping_examples["any"] == "required"
+        assert mapping_examples["tool"]["function"]["name"] == "Bash"

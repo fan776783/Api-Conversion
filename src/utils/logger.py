@@ -2,22 +2,74 @@
 日志配置
 统一日志管理，支持单文件和时间轮转
 """
+import json
 import logging
 import logging.handlers
-import sys
 import os
-import json
+import sys
 import traceback
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 # 全局日志器缓存，避免重复创建
 _loggers = {}
 
+# 北京时间（UTC+8）
+_BEIJING_TIMEZONE = timezone(timedelta(hours=8), name="CST")
+
 # 全局调试模式开关
 _debug_mode = False
+
+# 双模式日志常量
+LOG_MODE_OBSERVE = "OBSERVE"
+LOG_MODE_DIAGNOSE = "DIAGNOSE"
+_VALID_LOG_MODES = (LOG_MODE_OBSERVE, LOG_MODE_DIAGNOSE)
+
+# 运行时日志模式覆盖（None 表示使用环境/默认模式）
+_runtime_log_mode: Optional[str] = None
+
+
+class BeijingFormatter(logging.Formatter):
+    """统一使用北京时间输出日志时间。"""
+
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=_BEIJING_TIMEZONE)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+
+
+def _beijing_timestamp_iso() -> str:
+    """生成 ISO 风格北京时间字符串。"""
+    return datetime.now(_BEIJING_TIMEZONE).isoformat(timespec="milliseconds")
+
+
+def _normalize_log_mode(mode: Optional[str]) -> Optional[str]:
+    if not mode:
+        return None
+    mode_upper = str(mode).strip().upper()
+    if mode_upper in _VALID_LOG_MODES:
+        return mode_upper
+    return None
+
+
+def _resolve_log_mode() -> str:
+    if _runtime_log_mode in _VALID_LOG_MODES:
+        return _runtime_log_mode
+
+    env_mode = _normalize_log_mode(os.environ.get("LOG_MODE"))
+    if env_mode:
+        return env_mode
+
+    return LOG_MODE_DIAGNOSE if _debug_mode else LOG_MODE_OBSERVE
+
+
+def get_runtime_log_mode() -> str:
+    """获取当前运行时日志模式。"""
+    return _resolve_log_mode()
 
 
 def is_debug_enabled() -> bool:
@@ -25,10 +77,28 @@ def is_debug_enabled() -> bool:
     return _debug_mode
 
 
+def is_observe_mode() -> bool:
+    return _resolve_log_mode() == LOG_MODE_OBSERVE
+
+
+def is_diagnose_mode() -> bool:
+    return _resolve_log_mode() == LOG_MODE_DIAGNOSE
+
+
+def _resolve_handler_levels(base_level: str) -> tuple[str, str]:
+    """根据当前日志模式解析 console/file handler 级别。"""
+    mode = _resolve_log_mode()
+    if mode == LOG_MODE_DIAGNOSE:
+        return ("INFO", "DEBUG")
+    if mode == LOG_MODE_OBSERVE:
+        return ("INFO", "INFO")
+    return (base_level, base_level)
+
+
 def enable_debug(enabled: bool = True):
     """
     启用或禁用调试模式。
-    调试模式下，所有 logger 的级别会被设置为 DEBUG。
+    调试模式下，默认切换为 DIAGNOSE 模式（若未显式指定运行时模式）。
 
     Args:
         enabled: True 启用调试模式，False 禁用
@@ -37,94 +107,66 @@ def enable_debug(enabled: bool = True):
     _debug_mode = enabled
 
     # 更新所有已创建的 logger 的级别。
-    # 注意：调试模式下我们希望“文件里更详细、控制台更简洁”，所以不要把所有 handler 都强行设成 DEBUG。
     for logger in _loggers.values():
         try:
-            # 复用 setup_logger 的环境变量策略重新设置 handler 等级
             _reconfigure_logger_handlers(logger)
         except Exception:
-            # 保底：至少把 logger 本身放到 DEBUG，避免完全丢失 debug 记录
             logger.setLevel(logging.DEBUG if enabled else logging.INFO)
 
 
 def setup_logger(name: str, level: str = None) -> logging.Logger:
     """设置日志器"""
-    # 如果已经创建过，直接返回
     if name in _loggers:
         return _loggers[name]
 
-    # 导入环境配置
     try:
         from src.utils.env_config import env_config
         base_level = (level or env_config.log_level).upper()
         log_file = env_config.log_file
         log_max_days = env_config.log_max_days
     except ImportError:
-        # 如果无法导入环境配置，使用默认值
         base_level = (level or ("DEBUG" if _debug_mode else "WARNING")).upper()
         log_file = "logs/app.log"
         log_max_days = 1
 
-    # 支持把控制台和文件的日志级别拆开：
-    # - 默认不设置 CONSOLE_LOG_LEVEL/FILE_LOG_LEVEL 时，保持兼容（两者都跟 base_level 一致）
-    # - 调试模式下优先提升 FILE_LOG_LEVEL 到 DEBUG，便于落盘分析，同时控制台可保持更简洁
-    console_level = os.environ.get("CONSOLE_LOG_LEVEL", base_level).upper()
-    file_level = os.environ.get("FILE_LOG_LEVEL", base_level).upper()
-    if _debug_mode:
-        file_level = "DEBUG"
-        # Debug runs are typically for investigation; keep console readable by default.
-        if "CONSOLE_LOG_LEVEL" not in os.environ:
-            console_level = "INFO"
+    console_level, file_level = _resolve_handler_levels(base_level)
 
     def _lvl(s: str) -> int:
         return int(getattr(logging, s, logging.INFO))
 
     logger = logging.getLogger(name)
-    # logger level must be <= each handler level to allow records through.
     logger.setLevel(min(_lvl(console_level), _lvl(file_level)))
-
-    # 清除现有处理器
     logger.handlers.clear()
 
-    # 创建格式化器
-    formatter = logging.Formatter(
+    formatter = BeijingFormatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
 
-    # 创建控制台处理器
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(_lvl(console_level))
     console_handler.setFormatter(formatter)
-    # mark for enable_debug() reconfigure
     console_handler._handler_role = "console"  # type: ignore[attr-defined]
     logger.addHandler(console_handler)
 
-    # 创建文件处理器（时间轮转）
     try:
-        # 确保日志目录存在
         log_path = Path(log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # 使用TimedRotatingFileHandler进行时间轮转
         file_handler = logging.handlers.TimedRotatingFileHandler(
             filename=log_file,
-            when='midnight',  # 每天午夜轮转
-            interval=1,       # 间隔1天
-            backupCount=log_max_days,  # 保留的备份文件数量
+            when='midnight',
+            interval=1,
+            backupCount=log_max_days,
             encoding='utf-8',
             utc=False
         )
-
-        # 设置轮转文件的命名格式
         file_handler.suffix = "%Y-%m-%d"
-
         file_handler.setLevel(_lvl(file_level))
         file_handler.setFormatter(formatter)
         file_handler._handler_role = "file"  # type: ignore[attr-defined]
         logger.addHandler(file_handler)
 
     except Exception as e:
-        # 文件处理器失败时仅打印一次警告，不中断程序
         console_handler.emit(logging.LogRecord(
             name=name,
             level=logging.WARNING,
@@ -135,29 +177,20 @@ def setup_logger(name: str, level: str = None) -> logging.Logger:
             exc_info=None
         ))
 
-    # 防止日志传播到根日志器
     logger.propagate = False
-
-    # 缓存日志器
     _loggers[name] = logger
-
     return logger
 
 
 def _reconfigure_logger_handlers(logger: logging.Logger) -> None:
-    """Refresh handler levels for an already-created logger based on current env/debug flags."""
+    """Refresh handler levels for an already-created logger based on current mode."""
     try:
         from src.utils.env_config import env_config
         base_level = env_config.log_level.upper()
     except Exception:
         base_level = "WARNING"
 
-    console_level = os.environ.get("CONSOLE_LOG_LEVEL", base_level).upper()
-    file_level = os.environ.get("FILE_LOG_LEVEL", base_level).upper()
-    if _debug_mode:
-        file_level = "DEBUG"
-        if "CONSOLE_LOG_LEVEL" not in os.environ:
-            console_level = "INFO"
+    console_level, file_level = _resolve_handler_levels(base_level)
 
     def _lvl(s: str) -> int:
         return int(getattr(logging, s, logging.INFO))
@@ -171,44 +204,37 @@ def _reconfigure_logger_handlers(logger: logging.Logger) -> None:
         elif role == "file":
             h.setLevel(_lvl(file_level))
 
-# 运行时日志级别覆盖（None 表示使用环境配置的默认级别）
-_runtime_log_level: Optional[str] = None
+
+def set_runtime_log_mode(mode: str) -> None:
+    """运行时切换日志模式（无需重启）。"""
+    global _runtime_log_mode
+    mode_upper = _normalize_log_mode(mode)
+    if not mode_upper:
+        raise ValueError(f"无效的日志模式: {mode}，支持: {', '.join(_VALID_LOG_MODES)}")
+
+    _runtime_log_mode = mode_upper
+    for logger in _loggers.values():
+        _reconfigure_logger_handlers(logger)
+
+    print(f"[logger] 运行时日志模式已切换为: {mode_upper}")
 
 
 def set_runtime_log_level(level: str) -> None:
     """
-    运行时切换所有 logger 的日志级别（无需重启）。
-    设为 None 或空字符串则恢复为环境配置的默认级别。
+    兼容旧接口：将传统日志级别映射到双模式。
+    DEBUG -> DIAGNOSE，其余级别 -> OBSERVE
     """
-    global _runtime_log_level
-    valid_levels = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
-    level_upper = level.upper() if level else None
-
-    if level_upper and level_upper not in valid_levels:
-        raise ValueError(f"无效的日志级别: {level}，支持: {', '.join(valid_levels)}")
-
-    _runtime_log_level = level_upper
-    log_level = logging.getLevelName(level_upper) if level_upper else logging.INFO
-
-    # 更新所有已创建的 logger 及其 handler
-    for logger in _loggers.values():
-        logger.setLevel(log_level)
-        for handler in logger.handlers:
-            handler.setLevel(log_level)
-
-    # 用 print 而不是 logger 避免循环
-    print(f"[logger] 运行时日志级别已切换为: {level_upper or '默认'}")
+    level_upper = level.upper() if level else "INFO"
+    mapped_mode = LOG_MODE_DIAGNOSE if level_upper == "DEBUG" else LOG_MODE_OBSERVE
+    set_runtime_log_mode(mapped_mode)
 
 
 def get_runtime_log_level() -> str:
-    """获取当前运行时日志级别（如果有运行时覆盖则返回覆盖值，否则返回环境配置值）"""
-    if _runtime_log_level:
-        return _runtime_log_level
-    try:
-        from src.utils.env_config import env_config
-        return env_config.log_level.upper()
-    except Exception:
-        return "WARNING"
+    """
+    兼容旧接口：将双模式映射回传统级别。
+    OBSERVE -> INFO，DIAGNOSE -> DEBUG
+    """
+    return "DEBUG" if is_diagnose_mode() else "INFO"
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -231,9 +257,8 @@ def cleanup_old_logs():
 
         import time
         current_time = time.time()
-        max_age = log_max_days * 24 * 60 * 60  # 转换为秒
+        max_age = log_max_days * 24 * 60 * 60
 
-        # 清理旧的日志文件
         for file_path in log_dir.glob(f"{log_path.stem}.*"):
             if file_path.stat().st_mtime < (current_time - max_age):
                 try:
@@ -252,12 +277,11 @@ cleanup_old_logs()
 
 # ===================== 结构化错误日志 =====================
 
-# 错误类型常量
-ERROR_TYPE_NETWORK = "network"           # 网络错误：超时、连接失败、代理错误
-ERROR_TYPE_AUTH = "auth"                 # 认证错误：401/403
-ERROR_TYPE_RATE_LIMIT = "rate_limit"     # 限流错误：429
-ERROR_TYPE_CONVERSION = "conversion"     # 格式转换错误
-ERROR_TYPE_UPSTREAM_API = "upstream_api" # 上游API错误：非2xx响应、流式解析失败
+ERROR_TYPE_NETWORK = "network"
+ERROR_TYPE_AUTH = "auth"
+ERROR_TYPE_RATE_LIMIT = "rate_limit"
+ERROR_TYPE_CONVERSION = "conversion"
+ERROR_TYPE_UPSTREAM_API = "upstream_api"
 
 
 def _extract_request_id(
@@ -320,6 +344,214 @@ def _preview_body(body: Any, max_length: int = 2000) -> Optional[str]:
         return f"***preview failed: {e.__class__.__name__}***"
 
 
+def sanitize_url_for_log(url: Optional[str]) -> Optional[str]:
+    """对 URL 中的敏感 query 参数做脱敏。"""
+    if not url:
+        return url
+
+    try:
+        parsed = urlsplit(url)
+        query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        sanitized_pairs = []
+        sensitive_keys = {
+            "key", "api_key", "x-api-key", "authorization", "token", "access_token",
+            "refresh_token", "id_token", "sig", "signature",
+        }
+        for key, value in query_pairs:
+            if key.lower() in sensitive_keys:
+                sanitized_pairs.append((key, "***"))
+            else:
+                sanitized_pairs.append((key, value))
+        sanitized_query = urlencode(sanitized_pairs, doseq=True)
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, sanitized_query, parsed.fragment))
+    except Exception:
+        return url
+
+
+def _format_observe_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float):
+        return f"{value:.2f}"
+    if isinstance(value, (int, str)):
+        text = str(value).strip()
+        return text or None
+    try:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        return str(value)
+
+
+def _build_observe_message(event: str, fields: Dict[str, Any]) -> str:
+    parts = [f"[observe] {event}"]
+    for key, value in fields.items():
+        formatted = _format_observe_value(value)
+        if formatted is None:
+            continue
+        parts.append(f"{key}={formatted}")
+    return " ".join(parts)
+
+
+def log_diagnose_event(
+    logger: logging.Logger,
+    message: str,
+    *,
+    extra: Optional[Dict[str, Any]] = None,
+    level: int = logging.DEBUG,
+) -> None:
+    """问题定位模式下的上下文日志。"""
+    if not is_diagnose_mode():
+        return
+
+    if extra:
+        try:
+            message = f"{message} | {json.dumps(extra, ensure_ascii=False, default=str)}"
+        except Exception:
+            message = f"{message} | {extra}"
+    logger.log(level, message)
+
+
+def log_observe_request_start(
+    logger: logging.Logger,
+    *,
+    request_id: Optional[str] = None,
+    request_method: Optional[str] = None,
+    request_url: Optional[str] = None,
+    request_headers: Optional[Mapping[str, Any]] = None,
+    source_format: Optional[str] = None,
+    model: Optional[str] = None,
+    is_streaming: bool = False,
+    channel_name: Optional[str] = None,
+    channel_provider: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> str:
+    """记录请求开始的观测摘要。"""
+    effective_request_id = _extract_request_id(request_headers, request_id)
+    fields: Dict[str, Any] = {
+        "request_id": effective_request_id,
+        "method": request_method,
+        "path": urlsplit(request_url).path if request_url else None,
+        "source": source_format,
+        "client_model": model,
+        "streaming": is_streaming,
+        "channel": channel_name,
+        "provider": channel_provider,
+    }
+    if extra:
+        fields.update(extra)
+    logger.info(_build_observe_message("request_start", fields))
+    return effective_request_id
+
+
+def log_observe_request_done(
+    logger: logging.Logger,
+    *,
+    request_id: str,
+    source_format: Optional[str] = None,
+    request_method: Optional[str] = None,
+    request_path: Optional[str] = None,
+    channel_name: Optional[str] = None,
+    channel_provider: Optional[str] = None,
+    upstream_url: Optional[str] = None,
+    client_model: Optional[str] = None,
+    upstream_model: Optional[str] = None,
+    is_streaming: Optional[bool] = None,
+    status_code: Optional[int] = None,
+    duration_ms: Optional[float] = None,
+    ttfb_ms: Optional[float] = None,
+    input_chars: Optional[int] = None,
+    output_chars: Optional[int] = None,
+    usage: Optional[Dict[str, Any]] = None,
+    reasoning_mode: Optional[str] = None,
+    thinking_budget: Optional[int] = None,
+    chunk_count: Optional[int] = None,
+    note: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """记录请求完成的观测摘要。"""
+    fields: Dict[str, Any] = {
+        "request_id": request_id,
+        "source": source_format,
+        "method": request_method,
+        "path": request_path,
+        "provider": channel_provider,
+        "channel": channel_name,
+        "upstream_url": sanitize_url_for_log(upstream_url),
+        "client_model": client_model,
+        "upstream_model": upstream_model,
+        "streaming": is_streaming,
+        "status": status_code,
+        "duration_ms": duration_ms,
+        "ttfb_ms": ttfb_ms,
+        "input_chars": input_chars,
+        "output_chars": output_chars,
+        "chunk_count": chunk_count,
+        "reasoning_mode": reasoning_mode,
+        "thinking_budget": thinking_budget,
+        "note": note,
+    }
+    if usage:
+        fields.update({
+            "usage_in": usage.get("input_tokens"),
+            "usage_out": usage.get("output_tokens"),
+            "usage_total": usage.get("total_tokens"),
+            "reasoning_tokens": usage.get("reasoning_tokens"),
+            "cache_create_tokens": usage.get("cache_creation_input_tokens"),
+            "cache_read_tokens": usage.get("cache_read_input_tokens"),
+        })
+    if extra:
+        fields.update(extra)
+    logger.info(_build_observe_message("request_done", fields))
+
+
+def log_observe_request_failed(
+    logger: logging.Logger,
+    *,
+    request_id: Optional[str] = None,
+    request_headers: Optional[Mapping[str, Any]] = None,
+    source_format: Optional[str] = None,
+    request_method: Optional[str] = None,
+    request_path: Optional[str] = None,
+    channel_name: Optional[str] = None,
+    channel_provider: Optional[str] = None,
+    upstream_url: Optional[str] = None,
+    client_model: Optional[str] = None,
+    upstream_model: Optional[str] = None,
+    is_streaming: Optional[bool] = None,
+    status_code: Optional[int] = None,
+    duration_ms: Optional[float] = None,
+    error_type: Optional[str] = None,
+    stage: Optional[str] = None,
+    message: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> str:
+    """记录请求失败的观测摘要。"""
+    effective_request_id = _extract_request_id(request_headers, request_id)
+    fields: Dict[str, Any] = {
+        "request_id": effective_request_id,
+        "source": source_format,
+        "method": request_method,
+        "path": request_path,
+        "provider": channel_provider,
+        "channel": channel_name,
+        "upstream_url": sanitize_url_for_log(upstream_url),
+        "client_model": client_model,
+        "upstream_model": upstream_model,
+        "streaming": is_streaming,
+        "status": status_code,
+        "duration_ms": duration_ms,
+        "error_type": error_type,
+        "stage": stage,
+        "message": message,
+    }
+    if extra:
+        fields.update(extra)
+    logger.info(_build_observe_message("request_failed", fields))
+    return effective_request_id
+
+
 def log_structured_error(
     logger: logging.Logger,
     *,
@@ -356,9 +588,8 @@ def log_structured_error(
         生成或提取的 request_id
     """
     effective_request_id = _extract_request_id(request_headers, request_id)
-    timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    timestamp = _beijing_timestamp_iso()
 
-    # 异常信息
     exception_block: Dict[str, Any] = {}
     if exc is not None:
         exception_block["type"] = exc.__class__.__name__
@@ -373,11 +604,12 @@ def log_structured_error(
         "timestamp": timestamp,
         "logger": logger.name,
         "level": "ERROR",
+        "mode": get_runtime_log_mode(),
         "error_type": error_type,
         "request_id": effective_request_id,
         "request": {
             "method": request_method,
-            "url": request_url,
+            "url": sanitize_url_for_log(request_url),
             "headers": _summarize_headers(request_headers),
             "body": _preview_body(request_body),
         },
@@ -406,7 +638,6 @@ def log_structured_error(
         serialized = json.dumps(fallback, ensure_ascii=False)
 
     logger.error(f"[structured_error] {serialized}")
-
     return effective_request_id
 
 
@@ -424,42 +655,17 @@ def log_request_entry(
     channel_provider: Optional[str] = None,
     extra: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """
-    记录请求入口日志（INFO级别）。
-
-    Returns:
-        生成或提取的 request_id
-    """
-    effective_request_id = _extract_request_id(request_headers, request_id)
-    timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-
-    payload: Dict[str, Any] = {
-        "timestamp": timestamp,
-        "logger": logger.name,
-        "level": "INFO",
-        "type": "request_entry",
-        "request_id": effective_request_id,
-        "request": {
-            "method": request_method,
-            "url": request_url,
-        },
-        "source_format": source_format,
-        "model": model,
-        "is_streaming": is_streaming,
-        "channel": {
-            "name": channel_name,
-            "provider": channel_provider,
-        },
-    }
-
-    if extra:
-        payload["extra"] = extra
-
-    try:
-        serialized = json.dumps(payload, ensure_ascii=False)
-    except Exception:
-        serialized = json.dumps({"request_id": effective_request_id, "error": "serialization_failed"})
-
-    logger.info(f"[request_entry] {serialized}")
-
-    return effective_request_id
+    """兼容旧入口，转发到新的 OBSERVE 请求开始日志。"""
+    return log_observe_request_start(
+        logger,
+        request_id=request_id,
+        request_method=request_method,
+        request_url=request_url,
+        request_headers=request_headers,
+        source_format=source_format,
+        model=model,
+        is_streaming=is_streaming,
+        channel_name=channel_name,
+        channel_provider=channel_provider,
+        extra=extra,
+    )

@@ -15,7 +15,7 @@ from core.openai_detector import OpenAICapabilityDetector
 from core.anthropic_detector import AnthropicCapabilityDetector
 from core.gemini_detector import GeminiCapabilityDetector
 from src.utils.config import ConfigManager, ChannelConfig
-from src.utils.logger import setup_logger, set_runtime_log_level, get_runtime_log_level
+from src.utils.logger import setup_logger, set_runtime_log_mode, get_runtime_log_mode
 from src.utils.auth import auth_manager
 from src.utils.security import mask_api_key
 from api.conversion_api import router as conversion_router
@@ -249,11 +249,9 @@ async def dashboard(request: Request):
             <div class="header-bar">
                 <h1>AI API FORMAT CONVERSION</h1>
                 <div class="header-actions">
-                    <select id="logLevelSelect" onchange="changeLogLevel(this.value)" title="运行时日志级别" style="padding: 6px 10px; border-radius: 8px; border: 1px solid rgba(0,0,0,0.1); background: rgba(255,255,255,0.8); font-size: 13px; cursor: pointer; min-width: 90px;">
-                        <option value="DEBUG">DEBUG</option>
-                        <option value="INFO">INFO</option>
-                        <option value="WARNING">WARNING</option>
-                        <option value="ERROR">ERROR</option>
+                    <select id="logModeSelect" onchange="changeLogMode(this.value)" title="运行时日志模式" style="padding: 6px 10px; border-radius: 8px; border: 1px solid rgba(0,0,0,0.1); background: rgba(255,255,255,0.8); font-size: 13px; cursor: pointer; min-width: 120px;">
+                        <option value="OBSERVE">日常观测</option>
+                        <option value="DIAGNOSE">问题定位</option>
                     </select>
                     <button onclick="showChangePasswordModal()" class="btn-tertiary">修改密码</button>
                     <button onclick="logout()" class="btn-secondary">注销</button>
@@ -777,40 +775,55 @@ async def dashboard(request: Request):
                 }
             }
 
-            // 日志级别控制
-            async function changeLogLevel(level) {
+            // 日志模式控制
+            async function changeLogMode(mode) {
+                const select = document.getElementById('logModeSelect');
+                const previousMode = select ? select.dataset.currentMode || select.value : mode;
                 try {
-                    const response = await fetch('/api/log-level', {
+                    const response = await fetch('/api/log-mode', {
                         method: 'PUT',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ level })
+                        body: JSON.stringify({ mode })
                     });
                     const data = await response.json();
-                    if (data.success) {
-                        console.log('日志级别已切换为:', level);
+                    if (!response.ok || !data.success) {
+                        throw new Error(data.detail || data.message || '切换失败');
                     }
+                    if (select) {
+                        select.value = data.mode;
+                        select.dataset.currentMode = data.mode;
+                    }
+                    console.log('日志模式已切换为:', data.mode);
                 } catch (error) {
-                    console.error('切换日志级别失败:', error);
+                    if (select) {
+                        select.value = previousMode;
+                        select.dataset.currentMode = previousMode;
+                    }
+                    console.error('切换日志模式失败:', error);
                 }
             }
 
-            async function loadLogLevel() {
+            async function loadLogMode() {
                 try {
-                    const response = await fetch('/api/log-level');
+                    const response = await fetch('/api/log-mode');
                     const data = await response.json();
-                    if (data.success) {
-                        const select = document.getElementById('logLevelSelect');
-                        if (select) select.value = data.level;
+                    if (!response.ok || !data.success) {
+                        throw new Error(data.detail || data.message || '获取失败');
+                    }
+                    const select = document.getElementById('logModeSelect');
+                    if (select) {
+                        select.value = data.mode;
+                        select.dataset.currentMode = data.mode;
                     }
                 } catch (error) {
-                    console.error('获取日志级别失败:', error);
+                    console.error('获取日志模式失败:', error);
                 }
             }
 
             // 页面加载时初始化
             document.addEventListener('DOMContentLoaded', function() {
                 console.log('Dashboard loaded, user authenticated by server');
-                loadLogLevel();
+                loadLogMode();
 
                 console.log('Token exists, loading script.js...');
                 // 认证成功，加载主要功能脚本
@@ -988,22 +1001,30 @@ async def get_providers():
 # 原本此处的 @app.delete("/api/channels/{channel_id}") 端点与 conversion_api.py 重复
 # 为避免路由冲突，已移除。前端请求会自动使用 conversion_api.py 中的端点
 
-# 运行时日志级别控制 API
-@app.get("/api/log-level")
-async def get_log_level(_: bool = Depends(get_session_user)):
-    """获取当前日志级别"""
-    return {"success": True, "level": get_runtime_log_level()}
+# 运行时日志模式控制 API
+@app.get("/api/log-mode")
+async def get_log_mode(_: bool = Depends(get_session_user)):
+    """获取当前日志模式"""
+    return {"success": True, "mode": get_runtime_log_mode()}
 
 
-@app.put("/api/log-level")
-async def set_log_level(request: dict, _: bool = Depends(get_session_user)):
-    """运行时切换日志级别"""
-    level = request.get("level", "").strip().upper()
-    if not level:
-        raise HTTPException(status_code=400, detail="缺少 level 参数")
+@app.put("/api/log-mode")
+async def set_log_mode(request: dict, _: bool = Depends(get_session_user)):
+    """运行时切换日志模式"""
+    mode = request.get("mode", "").strip().upper()
+    if not mode:
+        raise HTTPException(status_code=400, detail="缺少 mode 参数")
     try:
-        set_runtime_log_level(level)
-        return {"success": True, "level": level, "message": f"日志级别已切换为 {level}"}
+        set_runtime_log_mode(mode)
+        mode_labels = {
+            "OBSERVE": "日常观测",
+            "DIAGNOSE": "问题定位",
+        }
+        return {
+            "success": True,
+            "mode": mode,
+            "message": f"日志模式已切换为 {mode_labels.get(mode, mode)}",
+        }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

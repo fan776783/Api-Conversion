@@ -323,7 +323,7 @@ class UnifiedMessage:
 
         # Handle tool response
         if self.role == "tool":
-            result["tool_call_id"] = self.tool_call_id or ""
+            result["tool_call_id"] = self.tool_call_id or self.name or ""
             result["content"] = self.content[0].tool_result_content if self.content else ""
             return result
 
@@ -532,7 +532,11 @@ class UnifiedChatRequest:
                     anthropic_tools.append({
                         "name": func.get("name", ""),
                         "description": func.get("description", ""),
-                        "input_schema": func.get("parameters", {}),
+                        "input_schema": (
+                            func.get("parameters")
+                            or func.get("parametersJsonSchema")
+                            or {}
+                        ),
                     })
                 else:
                     anthropic_tools.append(tool)
@@ -585,12 +589,14 @@ class UnifiedChatRequest:
             for tool in self.tools:
                 if "type" not in tool:
                     # Anthropic format -> OpenAI format
+                    input_schema = tool.get("input_schema") or tool.get("parameters") or {}
                     openai_tools.append({
                         "type": "function",
                         "function": {
                             "name": tool.get("name", ""),
                             "description": tool.get("description", ""),
-                            "parameters": tool.get("input_schema", {}),
+                            "parameters": input_schema,
+                            "parametersJsonSchema": input_schema,
                         },
                     })
                 else:

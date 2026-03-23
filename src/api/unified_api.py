@@ -24,9 +24,17 @@ from formats.converter_factory import (
 from formats.base_converter import ConversionResult
 from utils.security import mask_api_key, safe_log_request, safe_log_response
 from src.utils.logger import (
-    setup_logger, log_structured_error, log_request_entry,
-    ERROR_TYPE_NETWORK, ERROR_TYPE_AUTH, ERROR_TYPE_RATE_LIMIT,
-    ERROR_TYPE_CONVERSION, ERROR_TYPE_UPSTREAM_API
+    setup_logger,
+    log_structured_error,
+    log_request_entry,
+    log_observe_request_done,
+    log_observe_request_failed,
+    log_diagnose_event,
+    ERROR_TYPE_NETWORK,
+    ERROR_TYPE_AUTH,
+    ERROR_TYPE_RATE_LIMIT,
+    ERROR_TYPE_CONVERSION,
+    ERROR_TYPE_UPSTREAM_API,
 )
 from src.utils.exceptions import ChannelNotFoundError, ConversionError, APIError, TimeoutError
 from src.utils.http_client import get_http_client
@@ -62,6 +70,197 @@ def _extract_max_tokens(source_format: str, request_data: Dict[str, Any]) -> Opt
             except (TypeError, ValueError):
                 return None
     return None
+
+
+def _duration_ms(start_time: Optional[float], end_time: Optional[float]) -> Optional[float]:
+    """计算毫秒级耗时，缺失时返回 None"""
+    if start_time is None or end_time is None:
+        return None
+    return round(max((end_time - start_time) * 1000, 0.0), 2)
+
+
+
+def _extract_usage_metrics(provider: str, payload: Any) -> Dict[str, Any]:
+    """统一提取不同上游格式的 token 使用量"""
+    if not isinstance(payload, dict):
+        return {}
+
+    usage_metrics: Dict[str, Any] = {}
+
+    if provider == "openai":
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            if usage.get("prompt_tokens") is not None:
+                usage_metrics["input_tokens"] = usage.get("prompt_tokens")
+            if usage.get("completion_tokens") is not None:
+                usage_metrics["output_tokens"] = usage.get("completion_tokens")
+            if usage.get("total_tokens") is not None:
+                usage_metrics["total_tokens"] = usage.get("total_tokens")
+            details = usage.get("completion_tokens_details")
+            if isinstance(details, dict) and details.get("reasoning_tokens") is not None:
+                usage_metrics["reasoning_tokens"] = details.get("reasoning_tokens")
+
+    elif provider == "anthropic":
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+            ):
+                if usage.get(key) is not None:
+                    usage_metrics[key] = usage.get(key)
+            if usage_metrics.get("input_tokens") is not None and usage_metrics.get("output_tokens") is not None:
+                usage_metrics["total_tokens"] = usage_metrics["input_tokens"] + usage_metrics["output_tokens"]
+
+    elif provider == "gemini":
+        usage = payload.get("usageMetadata") or payload.get("usage")
+        if isinstance(usage, dict):
+            mapping = {
+                "promptTokenCount": "input_tokens",
+                "candidatesTokenCount": "output_tokens",
+                "totalTokenCount": "total_tokens",
+                "thoughtsTokenCount": "reasoning_tokens",
+            }
+            for source_key, target_key in mapping.items():
+                if usage.get(source_key) is not None:
+                    usage_metrics[target_key] = usage.get(source_key)
+
+    if not usage_metrics:
+        generic_usage = payload.get("usage")
+        if isinstance(generic_usage, dict):
+            for key in ("input_tokens", "output_tokens", "total_tokens", "reasoning_tokens"):
+                if generic_usage.get(key) is not None:
+                    usage_metrics[key] = generic_usage.get(key)
+
+    return usage_metrics
+
+
+
+def _safe_json_dumps(payload: Any) -> str:
+    try:
+        return json.dumps(payload, ensure_ascii=False, default=str)
+    except Exception:
+        return str(payload)
+
+
+def _count_payload_chars(payload: Any) -> int:
+    return len(_safe_json_dumps(payload)) if payload is not None else 0
+
+
+def _extract_reasoning_observe_fields(payload: Any, usage: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    fields: Dict[str, Any] = {}
+    if isinstance(payload, dict):
+        if payload.get("reasoning_effort") is not None:
+            fields["reasoning_mode"] = payload.get("reasoning_effort")
+        thinking = payload.get("thinking")
+        if isinstance(thinking, dict):
+            budget = thinking.get("budget_tokens")
+            if budget is not None:
+                fields["thinking_budget"] = budget
+            if fields.get("reasoning_mode") is None and thinking.get("type") == "enabled":
+                fields["reasoning_mode"] = "enabled"
+        generation_config = payload.get("generationConfig")
+        if isinstance(generation_config, dict):
+            thinking_config = generation_config.get("thinkingConfig")
+            if isinstance(thinking_config, dict):
+                budget = thinking_config.get("thinkingBudget")
+                if budget is not None:
+                    fields["thinking_budget"] = budget
+                if fields.get("reasoning_mode") is None:
+                    if budget == -1:
+                        fields["reasoning_mode"] = "dynamic"
+                    elif budget == 0:
+                        fields["reasoning_mode"] = "disabled"
+                    elif budget is not None:
+                        fields["reasoning_mode"] = "budgeted"
+        if payload.get("max_completion_tokens") is not None and fields.get("reasoning_mode") is None:
+            fields["reasoning_mode"] = payload.get("reasoning_effort") or "enabled"
+    if usage and usage.get("reasoning_tokens") is not None and fields.get("reasoning_mode") is None:
+        fields["reasoning_mode"] = "enabled"
+    return fields
+
+
+def _build_observe_context(
+    *,
+    request_id: Optional[str],
+    request_method: Optional[str],
+    request_path: Optional[str],
+    source_format: Optional[str],
+    channel: ChannelInfo,
+    upstream_url: Optional[str] = None,
+    client_model: Optional[str] = None,
+    upstream_model: Optional[str] = None,
+    is_streaming: Optional[bool] = None,
+    input_chars: Optional[int] = None,
+    reasoning_mode: Optional[str] = None,
+    thinking_budget: Optional[int] = None,
+) -> Dict[str, Any]:
+    return {
+        "request_id": request_id,
+        "request_method": request_method,
+        "request_path": request_path,
+        "source_format": source_format,
+        "channel_name": channel.name if channel else None,
+        "channel_provider": channel.provider if channel else None,
+        "upstream_url": upstream_url,
+        "client_model": client_model,
+        "upstream_model": upstream_model,
+        "is_streaming": is_streaming,
+        "input_chars": input_chars,
+        "reasoning_mode": reasoning_mode,
+        "thinking_budget": thinking_budget,
+    }
+
+
+def _log_upstream_metrics(
+    *,
+    request_id: Optional[str],
+    request_method: Optional[str],
+    request_path: Optional[str],
+    channel: ChannelInfo,
+    source_format: str,
+    upstream_url: Optional[str],
+    client_model: Optional[str],
+    upstream_model: Optional[str],
+    request_data: Dict[str, Any],
+    is_streaming: bool,
+    status_code: int,
+    total_ms: Optional[float],
+    ttfb_ms: Optional[float],
+    input_chars: Optional[int],
+    output_chars: Optional[int],
+    usage: Optional[Dict[str, Any]] = None,
+    chunk_count: Optional[int] = None,
+    note: Optional[str] = None,
+) -> None:
+    """输出统一的上游请求观测日志"""
+    reasoning_fields = _extract_reasoning_observe_fields(request_data, usage)
+    log_observe_request_done(
+        logger,
+        request_id=request_id or "unknown",
+        source_format=source_format,
+        request_method=request_method,
+        request_path=request_path,
+        channel_name=channel.name,
+        channel_provider=channel.provider,
+        upstream_url=upstream_url,
+        client_model=client_model,
+        upstream_model=upstream_model or (request_data.get("model") if isinstance(request_data, dict) else None),
+        is_streaming=is_streaming,
+        status_code=status_code,
+        duration_ms=total_ms,
+        ttfb_ms=ttfb_ms,
+        input_chars=input_chars,
+        output_chars=output_chars,
+        usage=usage,
+        reasoning_mode=reasoning_fields.get("reasoning_mode"),
+        thinking_budget=reasoning_fields.get("thinking_budget"),
+        chunk_count=chunk_count,
+        note=note,
+    )
+
 
 
 def _parse_upstream_error(provider: str, status_code: int, body: str) -> str:
@@ -104,7 +303,11 @@ def _parse_upstream_error(provider: str, status_code: int, body: str) -> str:
 async def fetch_models_from_channel_for_format(channel: ChannelInfo, target_format: str) -> List[Dict[str, Any]]:
     """从目标渠道获取模型列表并转换为指定格式"""
     try:
-        logger.info(f"Fetching models from {channel.provider} channel for {target_format} format")
+        log_diagnose_event(
+            logger,
+            "Fetching models for target format",
+            extra={"provider": channel.provider, "target_format": target_format},
+        )
         
         # 先获取原始模型数据
         raw_models = await fetch_raw_models_from_channel(channel)
@@ -132,7 +335,11 @@ async def fetch_models_from_channel_for_format(channel: ChannelInfo, target_form
 async def fetch_raw_models_from_channel(channel: ChannelInfo) -> List[Dict[str, Any]]:
     """从目标渠道获取原始模型数据"""
     try:
-        logger.info(f"Fetching raw models from {channel.provider} channel: {channel.name}")
+        log_diagnose_event(
+            logger,
+            "Fetching raw models from channel",
+            extra={"provider": channel.provider, "channel": channel.name},
+        )
         logger.debug(f"Channel details - Base URL: {channel.base_url}, API Key: {mask_api_key(channel.api_key)}")
         
         if channel.provider == "openai":
@@ -145,7 +352,7 @@ async def fetch_raw_models_from_channel(channel: ChannelInfo) -> List[Dict[str, 
             logger.error(f"Unknown provider: {channel.provider}")
             raise HTTPException(status_code=400, detail=f"Unsupported provider: {channel.provider}")
         
-        logger.info(f"Successfully fetched {len(raw_models)} raw models from {channel.provider} channel")
+        logger.debug(f"Successfully fetched {len(raw_models)} raw models from {channel.provider} channel")
         return raw_models
             
     except HTTPException:
@@ -161,7 +368,7 @@ async def fetch_raw_models_from_channel(channel: ChannelInfo) -> List[Dict[str, 
 
 async def fetch_openai_raw_models(channel: ChannelInfo) -> List[Dict[str, Any]]:
     """获取OpenAI原始模型数据"""
-    logger.info(f"Calling OpenAI models API: {channel.base_url}")
+    logger.debug(f"Calling OpenAI models API: {channel.base_url}")
     
     url = f"{channel.base_url.rstrip('/')}/models"
     headers = {
@@ -183,13 +390,13 @@ async def fetch_openai_raw_models(channel: ChannelInfo) -> List[Dict[str, Any]]:
         if not models:
             logger.warning("OpenAI API returned empty model list")
         
-        logger.info(f"Retrieved {len(models)} models from OpenAI API")
+        logger.debug(f"Retrieved {len(models)} models from OpenAI API")
         return models
 
 
 async def fetch_anthropic_raw_models(channel: ChannelInfo) -> List[Dict[str, Any]]:
     """获取Anthropic原始模型数据"""
-    logger.info(f"Calling Anthropic models API: {channel.base_url}")
+    logger.debug(f"Calling Anthropic models API: {channel.base_url}")
     
     url = f"{channel.base_url.rstrip('/')}/v1/models"
     headers = {
@@ -212,13 +419,13 @@ async def fetch_anthropic_raw_models(channel: ChannelInfo) -> List[Dict[str, Any
         if not models:
             logger.warning("Anthropic API returned empty model list")
         
-        logger.info(f"Retrieved {len(models)} models from Anthropic API")
+        logger.debug(f"Retrieved {len(models)} models from Anthropic API")
         return models
 
 
 async def fetch_gemini_raw_models(channel: ChannelInfo) -> List[Dict[str, Any]]:
     """获取Gemini原始模型数据"""
-    logger.info(f"Calling Gemini models API: {channel.base_url}")
+    logger.debug(f"Calling Gemini models API: {channel.base_url}")
     
     url = f"{channel.base_url.rstrip('/')}/models"
     params = {"key": channel.api_key}
@@ -237,7 +444,7 @@ async def fetch_gemini_raw_models(channel: ChannelInfo) -> List[Dict[str, Any]]:
         if not models:
             logger.warning("Gemini API returned empty model list")
         
-        logger.info(f"Retrieved {len(models)} models from Gemini API")
+        logger.debug(f"Retrieved {len(models)} models from Gemini API")
         return models
 
 
@@ -372,13 +579,21 @@ def extract_anthropic_api_key(x_api_key: Optional[str] = Header(None, alias="x-a
     
     # 首先尝试从x-api-key获取token
     if x_api_key:
-        logger.info(f"Extracted Anthropic API key from x-api-key: {mask_api_key(x_api_key)}")
+        log_diagnose_event(
+            logger,
+            "Extracted Anthropic API key from x-api-key",
+            extra={"api_key": mask_api_key(x_api_key)},
+        )
         return x_api_key
     
     # 如果x-api-key不存在，尝试从Authorization header获取
     if authorization and authorization.startswith("Bearer "):
         api_key = authorization[7:]  # 移除 "Bearer " 前缀
-        logger.info(f"Extracted Anthropic API key from Authorization header: {mask_api_key(api_key)}")
+        log_diagnose_event(
+            logger,
+            "Extracted Anthropic API key from Authorization header",
+            extra={"api_key": mask_api_key(api_key)},
+        )
         return api_key
     
     # 如果两种方式都无法获取token，则报错
@@ -389,9 +604,15 @@ def extract_anthropic_api_key(x_api_key: Optional[str] = Header(None, alias="x-a
 
 def extract_gemini_api_key(request: Request) -> str:
     """从Gemini格式的URL参数或header中提取API key"""
-    logger.info(f"Gemini auth - Request URL: {request.url}")
-    logger.info(f"Gemini auth - Query params: {dict(request.query_params)}")
-    logger.info(f"Gemini auth - Headers: {dict(request.headers)}")
+    log_diagnose_event(
+        logger,
+        "Gemini auth context",
+        extra={
+            "url": str(request.url),
+            "query": dict(request.query_params),
+            "headers": safe_log_request(dict(request.headers)),
+        },
+    )
     
     # Gemini API支持多种认证方式，按优先级检查：
     # 1. URL参数 ?key=your_api_key
@@ -421,17 +642,29 @@ async def forward_request_to_channel(
     channel: ChannelInfo,
     request_data: Dict[str, Any],
     source_format: str,
-    headers: Optional[Dict[str, str]] = None
+    headers: Optional[Dict[str, str]] = None,
+    request_started_at: Optional[float] = None,
+    request_id: Optional[str] = None,
+    request_method: Optional[str] = None,
+    request_path: Optional[str] = None,
 ):
     """转发请求到目标渠道（统一处理流式和非流式）"""
+    request_headers = headers or {}
+    client_model = request_data.get("model") if isinstance(request_data, dict) else None
+
     # 0. 解析模型名后缀（thinking 配置 + token 限制）
     # 注意：此处仅做解析和模型名替换，thinking/token 参数在格式转换后再注入（避免被转换器丢弃）
     original_model = request_data.get("model", "")
     suffix_result = parse_model_suffix(original_model)
     if suffix_result.base_model != suffix_result.original_model:
         request_data["model"] = suffix_result.base_model
-        logger.info(
-            f"模型名后缀解析: {suffix_result.original_model} → base_model={suffix_result.base_model}"
+        log_diagnose_event(
+            logger,
+            "模型名后缀解析",
+            extra={
+                "original_model": suffix_result.original_model,
+                "base_model": suffix_result.base_model,
+            },
         )
     
     # 0.5 应用渠道级 payload 配置（default/override）
@@ -455,14 +688,26 @@ async def forward_request_to_channel(
                     break
             
             if has_images:
-                logger.info(f"Anthropic-to-Anthropic with images detected, applying image ordering best practice")
+                log_diagnose_event(
+                    logger,
+                    "Anthropic same-format request requires image ordering conversion",
+                    extra={"source": source_format, "provider": channel.provider},
+                )
                 # 强制进行转换以应用图片排序最佳实践
                 conversion_result = convert_request(source_format, channel.provider, request_data, headers)
             else:
-                logger.info(f"Anthropic-to-Anthropic without images, using passthrough")
+                log_diagnose_event(
+                    logger,
+                    "Anthropic same-format request uses passthrough",
+                    extra={"source": source_format, "provider": channel.provider},
+                )
                 conversion_result = ConversionResult(success=True, data=request_data)
         else:
-            logger.info(f"Same format detected, skipping request conversion: {source_format} -> {channel.provider}")
+            log_diagnose_event(
+                logger,
+                "Same format detected, skipping request conversion",
+                extra={"source": source_format, "provider": channel.provider},
+            )
             # For Gemini passthrough, we need to remove the internal stream field 
             # because Gemini API doesn't accept it in the request body
             if channel.provider == "gemini" and request_data.get("stream"):
@@ -498,13 +743,23 @@ async def forward_request_to_channel(
                 or channel.models_mapping.get(original_model)
             )
             if mapped_model:
-                logger.info(f"Applying model mapping for channel {channel.name}: {original_req_model} -> {mapped_model}")
+                log_diagnose_event(
+                    logger,
+                    "Applying model mapping",
+                    extra={"channel": channel.name, "from": original_req_model, "to": mapped_model},
+                )
                 # 对映射后的模型名也做后缀解析（映射值可能包含后缀，如 "gpt-5.4(high)"）
                 mapped_suffix = parse_model_suffix(mapped_model)
                 if mapped_suffix.has_thinking_suffix or mapped_suffix.has_token_suffix:
-                    logger.info(
-                        f"模型映射值包含后缀: {mapped_model} → base={mapped_suffix.base_model}, "
-                        f"thinking={mapped_suffix.thinking.mode}, max_tokens={mapped_suffix.max_tokens}"
+                    log_diagnose_event(
+                        logger,
+                        "模型映射值包含后缀",
+                        extra={
+                            "mapped_model": mapped_model,
+                            "base_model": mapped_suffix.base_model,
+                            "thinking": mapped_suffix.thinking.mode,
+                            "max_tokens": mapped_suffix.max_tokens,
+                        },
                     )
                     # 用干净的 base_model 替换映射值
                     mapped_model = mapped_suffix.base_model
@@ -552,13 +807,21 @@ async def forward_request_to_channel(
     else:
         raise ValueError(f"Unsupported provider: {channel.provider}")
     
-    logger.info(
-        f"Conversion summary: {source_format}->{channel.provider}, "
-        f"streaming={is_streaming}, model={request_data.get('model')}, "
-        f"mapped_model={mapped_model or request_data.get('model')}"
+    input_chars = _count_payload_chars(conversion_result.data if isinstance(conversion_result.data, dict) else conversion_result.data)
+    reasoning_fields = _extract_reasoning_observe_fields(conversion_result.data)
+
+    log_diagnose_event(
+        logger,
+        "Conversion summary",
+        extra={
+            "source": source_format,
+            "provider": channel.provider,
+            "streaming": is_streaming,
+            "client_model": request_data.get('model'),
+            "upstream_model": mapped_model or request_data.get('model'),
+        },
     )
 
-    # 打印发送到上游的 thinking/token 关键参数（可观测性）
     if isinstance(conversion_result.data, dict):
         _upstream_params = {}
         for _k in (
@@ -568,24 +831,34 @@ async def forward_request_to_channel(
             if _k in conversion_result.data:
                 _upstream_params[_k] = conversion_result.data[_k]
         if _upstream_params:
-            logger.info(f"🧠 上游 thinking/token 参数: {_upstream_params}")
+            log_diagnose_event(logger, "上游 thinking/token 参数", extra=_upstream_params)
 
     # 3. 统一请求处理
     try:
-        logger.debug(f"Sending {'streaming' if is_streaming else 'non-streaming'} request to {channel.provider}: {url}")
-        # 只打印关键参数，跳过 messages 内容（太长）
+        log_diagnose_event(
+            logger,
+            f"Sending {'streaming' if is_streaming else 'non-streaming'} request to {channel.provider}: {url}"
+        )
         if isinstance(conversion_result.data, dict):
             _req_summary = {k: v for k, v in conversion_result.data.items() if k != 'messages'}
             _req_summary['messages_count'] = len(conversion_result.data.get('messages', []))
-            logger.debug(f"Request params: {json.dumps(_req_summary, ensure_ascii=False, default=str)}")
+            log_diagnose_event(logger, "Request params", extra=_req_summary)
         
         # 检查渠道是否配置了代理
         if getattr(channel, 'use_proxy', False):
             proxy_host = getattr(channel, 'proxy_host', None)
             proxy_port = getattr(channel, 'proxy_port', None)
-            logger.info(f"PROXY CHECK: Channel {channel.name} has proxy enabled - {proxy_host}:{proxy_port}")
+            log_diagnose_event(
+                logger,
+                "Proxy enabled for channel",
+                extra={"channel": channel.name, "proxy_host": proxy_host, "proxy_port": proxy_port},
+            )
         else:
-            logger.info(f"PROXY CHECK: Channel {channel.name} has no proxy configured")
+            log_diagnose_event(
+                logger,
+                "Proxy disabled for channel",
+                extra={"channel": channel.name},
+            )
         
         if is_streaming:
             # 流式请求处理 - 创建独立的生成器函数
@@ -598,7 +871,22 @@ async def forward_request_to_channel(
                             json=conversion_result.data,
                             headers=target_headers
                         ) as response:
-                            async for chunk in handle_streaming_response(response, channel, request_data, source_format):
+                            upstream_response_started_at = time.perf_counter()
+                            async for chunk in handle_streaming_response(
+                                response,
+                                channel,
+                                request_data,
+                                source_format,
+                                request_started_at=request_started_at,
+                                upstream_response_started_at=upstream_response_started_at,
+                                request_id=request_id,
+                                request_method=request_method,
+                                request_path=request_path,
+                                upstream_url=url,
+                                client_model=client_model,
+                                upstream_model=mapped_model or (conversion_result.data.get("model") if isinstance(conversion_result.data, dict) else None),
+                                input_chars=input_chars,
+                            ):
                                 yield chunk
                 except httpx.TimeoutException as e:
                     log_structured_error(
@@ -607,7 +895,7 @@ async def forward_request_to_channel(
                         exc=e,
                         request_method="POST",
                         request_url=url,
-                        request_headers=headers,
+                        request_headers=request_headers,
                         request_body=conversion_result.data,
                         extra={
                             "channel_name": channel.name,
@@ -629,7 +917,7 @@ async def forward_request_to_channel(
                         exc=e,
                         request_method="POST",
                         request_url=url,
-                        request_headers=headers,
+                        request_headers=request_headers,
                         request_body=conversion_result.data,
                         extra={
                             "channel_name": channel.name,
@@ -650,7 +938,22 @@ async def forward_request_to_channel(
                     json=conversion_result.data,
                     headers=target_headers
                 )
-                result = handle_non_streaming_response(response, channel, request_data, source_format)
+                upstream_response_started_at = time.perf_counter()
+                result = handle_non_streaming_response(
+                    response,
+                    channel,
+                    request_data,
+                    source_format,
+                    request_started_at=request_started_at,
+                    upstream_response_started_at=upstream_response_started_at,
+                    request_id=request_id,
+                    request_method=request_method,
+                    request_path=request_path,
+                    upstream_url=url,
+                    client_model=client_model,
+                    upstream_model=mapped_model or (conversion_result.data.get("model") if isinstance(conversion_result.data, dict) else None),
+                    input_chars=input_chars,
+                )
                 return result
                     
     except httpx.TimeoutException as e:
@@ -660,7 +963,7 @@ async def forward_request_to_channel(
             exc=e,
             request_method="POST",
             request_url=url,
-            request_headers=headers,
+            request_headers=request_headers,
             request_body=conversion_result.data,
             extra={
                 "channel_name": channel.name,
@@ -669,6 +972,24 @@ async def forward_request_to_channel(
                 "stage": "forward_request_to_channel",
                 "timeout": channel.timeout,
             },
+        )
+        log_observe_request_failed(
+            logger,
+            request_id=request_id,
+            request_headers=request_headers,
+            source_format=source_format,
+            request_method=request_method,
+            request_path=request_path,
+            channel_name=channel.name,
+            channel_provider=channel.provider,
+            upstream_url=url,
+            client_model=client_model,
+            upstream_model=mapped_model or (conversion_result.data.get("model") if isinstance(conversion_result.data, dict) else None),
+            is_streaming=is_streaming,
+            duration_ms=_duration_ms(request_started_at, time.perf_counter()),
+            error_type=ERROR_TYPE_NETWORK,
+            stage="forward_request_to_channel",
+            message=f"Non-streaming request timeout after {channel.timeout} seconds",
         )
         raise TimeoutError(f"Non-streaming request timeout after {channel.timeout} seconds")
     except HTTPException:
@@ -681,7 +1002,7 @@ async def forward_request_to_channel(
             exc=e,
             request_method="POST",
             request_url=url,
-            request_headers=headers,
+            request_headers=request_headers,
             request_body=conversion_result.data,
             extra={
                 "channel_name": channel.name,
@@ -693,9 +1014,27 @@ async def forward_request_to_channel(
         raise APIError(f"Non-streaming request failed: {e}")
 
 
-async def handle_streaming_response(response, channel, request_data, source_format):
+async def handle_streaming_response(
+    response,
+    channel,
+    request_data,
+    source_format,
+    request_started_at: Optional[float] = None,
+    upstream_response_started_at: Optional[float] = None,
+    request_id: Optional[str] = None,
+    request_method: Optional[str] = None,
+    request_path: Optional[str] = None,
+    upstream_url: Optional[str] = None,
+    client_model: Optional[str] = None,
+    upstream_model: Optional[str] = None,
+    input_chars: Optional[int] = None,
+):
     """处理流式响应"""
-    logger.info(f"STREAMING RESPONSE: channel.provider='{channel.provider}', source_format='{source_format}', status={response.status_code}")
+    log_diagnose_event(
+        logger,
+        "Streaming response started",
+        extra={"provider": channel.provider, "source_format": source_format, "status": response.status_code},
+    )
     
     if response.status_code == 200:
         # 为当前请求流初始化独立的 converter 上下文，避免并发状态串扰
@@ -703,6 +1042,10 @@ async def handle_streaming_response(response, channel, request_data, source_form
 
         chunk_count = 0
         sent_end_marker = False
+        first_payload_sent = False
+        first_payload_at: Optional[float] = None
+        final_usage: Dict[str, Any] = {}
+        output_chars = 0
         
         # 根据客户端期望的格式选择合适的结束标记
         if source_format == "openai":
@@ -718,18 +1061,47 @@ async def handle_streaming_response(response, channel, request_data, source_form
 
         # For same-format passthrough, we need to preserve the complete SSE structure
         if channel.provider == source_format:
-            logger.info(f"PASSTHROUGH MODE ACTIVATED: {channel.provider} -> {source_format}")
-            logger.info(f"PASSTHROUGH: Response status = {response.status_code}")
-            logger.info(f"PASSTHROUGH: Response headers = {dict(response.headers)}")
+            log_diagnose_event(
+                logger,
+                "Passthrough mode activated",
+                extra={
+                    "provider": channel.provider,
+                    "source_format": source_format,
+                    "status": response.status_code,
+                    "headers": safe_log_request(dict(response.headers)),
+                },
+            )
             
             # Direct passthrough using aiter_bytes to preserve exact formatting
             # 使用字节流传输以保持原始格式不变
             try:
                 async for chunk in response.aiter_bytes():
                     if chunk:  # 只传输非空chunk
-                        yield chunk.decode('utf-8')
+                        decoded_chunk = chunk.decode('utf-8')
+                        output_chars += len(decoded_chunk)
+                        yield decoded_chunk
                             
-                logger.info(f"PASSTHROUGH COMPLETED")
+                log_diagnose_event(logger, "Passthrough completed")
+                _log_upstream_metrics(
+                    request_id=request_id,
+                    request_method=request_method,
+                    request_path=request_path,
+                    channel=channel,
+                    source_format=source_format,
+                    upstream_url=upstream_url,
+                    client_model=client_model,
+                    upstream_model=upstream_model,
+                    request_data=request_data,
+                    is_streaming=True,
+                    status_code=response.status_code,
+                    total_ms=_duration_ms(request_started_at, time.perf_counter()),
+                    ttfb_ms=_duration_ms(request_started_at, upstream_response_started_at),
+                    input_chars=input_chars,
+                    output_chars=output_chars,
+                    usage=final_usage or None,
+                    chunk_count=chunk_count,
+                    note="stream_passthrough_completed",
+                )
             except Exception as e:
                 logger.error(f"PASSTHROUGH ERROR: {e}")
                 raise
@@ -759,11 +1131,35 @@ async def handle_streaming_response(response, channel, request_data, source_form
 
             # 处理结束哨兵或空数据 - 必须在JSON解析之前检查
             if data_content.strip() in ("[DONE]", ""):
-                logger.info(f"Stream ended with marker: '{data_content.strip()}'")
-                logger.info(f"Sending end_marker to client: '{end_marker}'")
+                log_diagnose_event(
+                    logger,
+                    "Stream ended with marker",
+                    extra={"marker": data_content.strip(), "end_marker": end_marker},
+                )
                 if end_marker and not sent_end_marker:  # 避免重复发送结束事件
+                    output_chars += len(end_marker)
                     yield end_marker
                     sent_end_marker = True
+                _log_upstream_metrics(
+                    request_id=request_id,
+                    request_method=request_method,
+                    request_path=request_path,
+                    channel=channel,
+                    source_format=source_format,
+                    upstream_url=upstream_url,
+                    client_model=client_model,
+                    upstream_model=upstream_model,
+                    request_data=request_data,
+                    is_streaming=True,
+                    status_code=response.status_code,
+                    total_ms=_duration_ms(request_started_at, time.perf_counter()),
+                    ttfb_ms=_duration_ms(request_started_at, first_payload_at) if first_payload_at else None,
+                    input_chars=input_chars,
+                    output_chars=output_chars,
+                    usage=final_usage or None,
+                    chunk_count=chunk_count,
+                    note="stream_end_marker",
+                )
                 break
             
             try:
@@ -852,11 +1248,17 @@ async def handle_streaming_response(response, channel, request_data, source_form
                         import traceback
                         logger.error(f"Traceback: {traceback.format_exc()}")
                         # 发送原始数据作为后备，然后继续处理下一个chunk
-                        yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
+                        fallback_payload = f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
+                        output_chars += len(fallback_payload)
+                        yield fallback_payload
                         continue
                     
                     if response_conversion and response_conversion.success:
                         converted_data = response_conversion.data
+                        if isinstance(chunk_data, dict):
+                            extracted_usage = _extract_usage_metrics(channel.provider, chunk_data)
+                            if extracted_usage:
+                                final_usage = extracted_usage
 
                         # 对于 Anthropic SSE：如果转换器已经输出 message_stop，就不要再额外补一个 end_marker。
                         if source_format == "anthropic":
@@ -868,29 +1270,44 @@ async def handle_streaming_response(response, channel, request_data, source_form
                         if isinstance(converted_data, str):
                             # 如果是SSE格式字符串（Anthropic），直接输出
                             if converted_data.strip():  # 只有非空字符串才输出
+                                if not first_payload_sent:
+                                    first_payload_sent = True
+                                    first_payload_at = time.perf_counter()
                                 if should_log_chunk or is_finish_chunk:
                                     logger.debug(
                                         f"Sending SSE chunk {chunk_count}: {converted_data[:100]}..."
                                     )
+                                output_chars += len(converted_data)
                                 yield converted_data
                         elif isinstance(converted_data, list):
                             # 多个事件，逐个发送保持事件边界
                             for ev in converted_data:
                                 if ev.strip():
+                                    if not first_payload_sent:
+                                        first_payload_sent = True
+                                        first_payload_at = time.perf_counter()
                                     if should_log_chunk or is_finish_chunk:
                                         logger.debug(
                                             f"Sending SSE chunk {chunk_count}: {ev[:100]}..."
                                         )
+                                    output_chars += len(ev)
                                     yield ev
                         else:
                             # 如果是JSON对象（OpenAI/Gemini），包装成data字段
+                            if not first_payload_sent:
+                                first_payload_sent = True
+                                first_payload_at = time.perf_counter()
                             if should_log_chunk or is_finish_chunk:
                                 logger.debug(f"Sending JSON chunk {chunk_count} to client")
-                            yield f"data: {json.dumps(converted_data, ensure_ascii=False)}\n\n"
+                            payload = f"data: {json.dumps(converted_data, ensure_ascii=False)}\n\n"
+                            output_chars += len(payload)
+                            yield payload
                     else:
                         # 如果转换失败，返回原始数据
                         logger.warning(f"Conversion failed: {response_conversion.error}")
-                        yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
+                        fallback_payload = f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
+                        output_chars += len(fallback_payload)
+                        yield fallback_payload
                 
                 # 检查是否是结束chunk（各种格式的结束标记）
                 # 注意：如果chunk既有内容又是结束，避免重复处理（内容处理时已经处理了结束逻辑）
@@ -908,7 +1325,8 @@ async def handle_streaming_response(response, channel, request_data, source_form
                             _details = _usage.get("completion_tokens_details", {})
                             if _details:
                                 _usage_log["reasoning_tokens"] = _details.get("reasoning_tokens")
-                            logger.info(f"📊 上游响应 usage: {_usage_log}")
+                            logger.debug(f"📊 上游响应 usage: {_usage_log}")
+                            final_usage = _extract_usage_metrics(channel.provider, chunk_data) or final_usage
                 
                 if is_finish_chunk and not has_content:
                     # 转换并发送结束chunk
@@ -921,8 +1339,11 @@ async def handle_streaming_response(response, channel, request_data, source_form
                         import traceback
                         logger.error(f"Traceback: {traceback.format_exc()}")
                         # 发送原始数据作为后备
-                        yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
+                        fallback_payload = f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
+                        output_chars += len(fallback_payload)
+                        yield fallback_payload
                         if end_marker and not sent_end_marker:  # 避免重复发送结束事件
+                            output_chars += len(end_marker)
                             yield end_marker
                             sent_end_marker = True
                         break
@@ -940,19 +1361,44 @@ async def handle_streaming_response(response, channel, request_data, source_form
                             for event in converted_data:
                                 if event.strip():
                                     logger.debug(f"Sending finish event: {event[:100]}...")
+                                    output_chars += len(event)
                                     yield event
                         elif isinstance(converted_data, str):
                             if converted_data.strip():
                                 logger.debug(f"Sending finish chunk: {converted_data[:100]}...")
+                                output_chars += len(converted_data)
                                 yield converted_data
                         else:
                             logger.debug(f"Sending finish chunk to client: {json.dumps(converted_data, ensure_ascii=False)}")
-                            yield f"data: {json.dumps(converted_data, ensure_ascii=False)}\n\n"
+                            finish_payload = f"data: {json.dumps(converted_data, ensure_ascii=False)}\n\n"
+                            output_chars += len(finish_payload)
+                            yield finish_payload
                     
                     # 发送结束标记
                     if end_marker and not sent_end_marker:  # 避免重复发送结束事件
+                        output_chars += len(end_marker)
                         yield end_marker
                         sent_end_marker = True
+                    _log_upstream_metrics(
+                        request_id=request_id,
+                        request_method=request_method,
+                        request_path=request_path,
+                        channel=channel,
+                        source_format=source_format,
+                        upstream_url=upstream_url,
+                        client_model=client_model,
+                        upstream_model=upstream_model,
+                        request_data=request_data,
+                        is_streaming=True,
+                        status_code=response.status_code,
+                        total_ms=_duration_ms(request_started_at, time.perf_counter()),
+                        ttfb_ms=_duration_ms(request_started_at, first_payload_at) if first_payload_at else None,
+                        input_chars=input_chars,
+                        output_chars=output_chars,
+                        usage=final_usage or None,
+                        chunk_count=chunk_count,
+                        note="stream_finish_chunk",
+                    )
                     break
                     
             except json.JSONDecodeError as e:
@@ -978,19 +1424,49 @@ async def handle_streaming_response(response, channel, request_data, source_form
                 if "[DONE]" in data_content:
                     logger.warning(f"Found [DONE] in malformed chunk: '{data_content}', sending end marker")
                     if end_marker and not sent_end_marker:
+                        output_chars += len(end_marker)
                         yield end_marker
                         sent_end_marker = True
                     break
                 
                 # 对于其他非法JSON，尝试透传（保持连接）
                 logger.warning(f"Attempting to pass through malformed chunk as-is")
-                yield f"data: {data_content}\n\n"
+                malformed_payload = f"data: {data_content}\n\n"
+                output_chars += len(malformed_payload)
+                yield malformed_payload
                 continue
         
-        logger.info(
-            f"Streaming completed: provider={channel.provider}, client_format={source_format}, "
-            f"chunks={chunk_count}, end_marker_sent={sent_end_marker}"
+        log_diagnose_event(
+            logger,
+            "Streaming completed",
+            extra={
+                "provider": channel.provider,
+                "client_format": source_format,
+                "chunks": chunk_count,
+                "end_marker_sent": sent_end_marker,
+            },
         )
+        if chunk_count > 0 and not sent_end_marker:
+            _log_upstream_metrics(
+                request_id=request_id,
+                request_method=request_method,
+                request_path=request_path,
+                channel=channel,
+                source_format=source_format,
+                upstream_url=upstream_url,
+                client_model=client_model,
+                upstream_model=upstream_model,
+                request_data=request_data,
+                is_streaming=True,
+                status_code=response.status_code,
+                total_ms=_duration_ms(request_started_at, time.perf_counter()),
+                ttfb_ms=_duration_ms(request_started_at, first_payload_at) if first_payload_at else None,
+                input_chars=input_chars,
+                output_chars=output_chars,
+                usage=final_usage or None,
+                chunk_count=chunk_count,
+                note="stream_completed_without_end_marker",
+            )
         
         # 如果没有处理任何chunks，发送错误响应
         if chunk_count == 0:
@@ -1007,8 +1483,11 @@ async def handle_streaming_response(response, channel, request_data, source_form
                     "finish_reason": "stop"
                 }]
             }
-            yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+            error_payload = f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+            output_chars += len(error_payload)
+            yield error_payload
             if end_marker and not sent_end_marker:  # 避免重复发送结束事件
+                output_chars += len(end_marker)
                 yield end_marker
                 sent_end_marker = True
     else:
@@ -1033,6 +1512,9 @@ async def handle_streaming_response(response, channel, request_data, source_form
         log_structured_error(
             logger,
             error_type=error_type,
+            request_id=request_id,
+            request_method=request_method,
+            request_url=upstream_url,
             request_body=request_data,
             response_status=status,
             response_headers=dict(response.headers),
@@ -1047,6 +1529,25 @@ async def handle_streaming_response(response, channel, request_data, source_form
             },
         )
 
+        log_observe_request_failed(
+            logger,
+            request_id=request_id,
+            source_format=source_format,
+            request_method=request_method,
+            request_path=request_path,
+            channel_name=channel.name,
+            channel_provider=channel.provider,
+            upstream_url=upstream_url,
+            client_model=client_model,
+            upstream_model=upstream_model,
+            is_streaming=True,
+            status_code=status,
+            duration_ms=_duration_ms(request_started_at, time.perf_counter()),
+            error_type=error_type,
+            stage="streaming_response_status",
+            message=friendly_error,
+        )
+
         # 对于 400 错误，抛出 HTTPException 以便返回清晰的错误信息
         if status == 400:
             raise HTTPException(status_code=400, detail=friendly_error)
@@ -1054,13 +1555,52 @@ async def handle_streaming_response(response, channel, request_data, source_form
         raise APIError(friendly_error)
 
 
-def handle_non_streaming_response(response, channel, request_data, source_format):
+def handle_non_streaming_response(
+    response,
+    channel,
+    request_data,
+    source_format,
+    request_started_at: Optional[float] = None,
+    upstream_response_started_at: Optional[float] = None,
+    request_id: Optional[str] = None,
+    request_method: Optional[str] = None,
+    request_path: Optional[str] = None,
+    upstream_url: Optional[str] = None,
+    client_model: Optional[str] = None,
+    upstream_model: Optional[str] = None,
+    input_chars: Optional[int] = None,
+):
     """处理非流式响应"""
-    logger.info(f"Received response from {channel.provider}: status={response.status_code}")
+    log_diagnose_event(
+        logger,
+        "Non-streaming response received",
+        extra={"provider": channel.provider, "status": response.status_code},
+    )
     
     # 处理非流式响应
     if response.status_code == 200:
         response_data = response.json()
+        usage_metrics = _extract_usage_metrics(channel.provider, response_data)
+        output_chars = _count_payload_chars(response_data)
+        _log_upstream_metrics(
+            request_id=request_id,
+            request_method=request_method,
+            request_path=request_path,
+            channel=channel,
+            source_format=source_format,
+            upstream_url=upstream_url,
+            client_model=client_model,
+            upstream_model=upstream_model,
+            request_data=request_data,
+            is_streaming=False,
+            status_code=response.status_code,
+            total_ms=_duration_ms(request_started_at, time.perf_counter()),
+            ttfb_ms=_duration_ms(request_started_at, upstream_response_started_at),
+            input_chars=input_chars,
+            output_chars=output_chars,
+            usage=usage_metrics or None,
+            note="non_streaming_response",
+        )
         logger.debug(f"Received response from {channel.provider}: {safe_log_response(response_data)}")
         
         # 检查是否为同格式透传
@@ -1104,6 +1644,9 @@ def handle_non_streaming_response(response, channel, request_data, source_format
         log_structured_error(
             logger,
             error_type=ERROR_TYPE_RATE_LIMIT,
+            request_id=request_id,
+            request_method=request_method,
+            request_url=upstream_url,
             request_body=request_data,
             response_status=response.status_code,
             response_headers=dict(response.headers),
@@ -1115,6 +1658,26 @@ def handle_non_streaming_response(response, channel, request_data, source_format
                 "retry_after": retry_after,
                 "stage": "non_streaming_response",
             },
+        )
+
+        log_observe_request_failed(
+            logger,
+            request_id=request_id,
+            source_format=source_format,
+            request_method=request_method,
+            request_path=request_path,
+            channel_name=channel.name,
+            channel_provider=channel.provider,
+            upstream_url=upstream_url,
+            client_model=client_model,
+            upstream_model=upstream_model,
+            is_streaming=False,
+            status_code=response.status_code,
+            duration_ms=_duration_ms(request_started_at, time.perf_counter()),
+            error_type=ERROR_TYPE_RATE_LIMIT,
+            stage="non_streaming_response",
+            message="Rate limit exceeded",
+            extra={"retry_after": retry_after},
         )
 
         # 抛出 HTTPException 由上层统一处理
@@ -1136,6 +1699,9 @@ def handle_non_streaming_response(response, channel, request_data, source_format
         log_structured_error(
             logger,
             error_type=error_type,
+            request_id=request_id,
+            request_method=request_method,
+            request_url=upstream_url,
             request_body=request_data,
             response_status=status,
             response_headers=dict(response.headers),
@@ -1147,6 +1713,25 @@ def handle_non_streaming_response(response, channel, request_data, source_format
                 "stage": "non_streaming_response",
                 "friendly_error": friendly_error,
             },
+        )
+
+        log_observe_request_failed(
+            logger,
+            request_id=request_id,
+            source_format=source_format,
+            request_method=request_method,
+            request_path=request_path,
+            channel_name=channel.name,
+            channel_provider=channel.provider,
+            upstream_url=upstream_url,
+            client_model=client_model,
+            upstream_model=upstream_model,
+            is_streaming=False,
+            status_code=status,
+            duration_ms=_duration_ms(request_started_at, time.perf_counter()),
+            error_type=error_type,
+            stage="non_streaming_response",
+            message=friendly_error,
         )
 
         # 对于 400 错误，直接返回清晰的错误信息
@@ -1185,12 +1770,12 @@ async def list_models_unified(
             # OpenAI格式认证
             api_key = authorization[7:]
             target_format = "openai"
-            logger.info(f"OpenAI format models request with API key: {mask_api_key(api_key)}")
+            log_diagnose_event(logger, "Models request auth detected", extra={"format": target_format, "api_key": mask_api_key(api_key)})
         elif x_api_key:
             # Anthropic格式认证
             api_key = x_api_key
             target_format = "anthropic"
-            logger.info(f"Anthropic format models request with API key: {mask_api_key(api_key)}")
+            log_diagnose_event(logger, "Models request auth detected", extra={"format": target_format, "api_key": mask_api_key(api_key)})
         else:
             raise HTTPException(status_code=401, detail="Missing authorization header")
         
@@ -1199,12 +1784,12 @@ async def list_models_unified(
             logger.error(f"No channel found for API key: {mask_api_key(api_key)}")
             raise HTTPException(status_code=401, detail="Invalid API key")
         
-        logger.info(f"Found channel: {channel.name} (provider: {channel.provider})")
+        log_diagnose_event(logger, "Models request channel resolved", extra={"channel": channel.name, "provider": channel.provider})
         
         # 从目标渠道获取真实的模型列表，转换为指定格式
         models = await fetch_models_from_channel_for_format(channel, target_format)
         
-        logger.info(f"Returning {len(models)} {target_format} format models")
+        logger.debug(f"Returning {len(models)} {target_format} format models")
         
         # 根据格式返回不同的响应结构
         if target_format == "openai":
@@ -1234,19 +1819,19 @@ async def list_models_unified(
 async def list_gemini_models(api_key: str = Depends(extract_gemini_api_key)):
     """Gemini格式：列出可用模型"""
     try:
-        logger.info(f"Gemini format models request with API key: {mask_api_key(api_key)}")
+        log_diagnose_event(logger, "Gemini models request auth detected", extra={"api_key": mask_api_key(api_key)})
         
         channel = channel_manager.get_channel_by_custom_key(api_key)
         if not channel:
             logger.error(f"No channel found for API key: {mask_api_key(api_key)}")
             raise HTTPException(status_code=401, detail="Invalid API key")
         
-        logger.info(f"Found channel: {channel.name} (provider: {channel.provider})")
+        log_diagnose_event(logger, "Gemini models request channel resolved", extra={"channel": channel.name, "provider": channel.provider})
         
         # 从目标渠道获取真实的模型列表，转换为Gemini格式
         models = await fetch_models_from_channel_for_format(channel, "gemini")
         
-        logger.info(f"Returning {len(models)} Gemini format models")
+        logger.debug(f"Returning {len(models)} Gemini format models")
         
         return {
             "models": models
@@ -1346,14 +1931,14 @@ async def unified_gemini_count_tokens_endpoint(
     api_key: str = Depends(extract_gemini_api_key)
 ):
     """Gemini格式countTokens端点（用于计算token数量）"""
-    logger.info(f"Gemini countTokens request for model: {model_id}")
+    log_diagnose_event(logger, "Gemini countTokens request received", extra={"model_id": model_id})
     
     try:
         # 清理模型ID，移除可能的countTokens后缀
         clean_model_id = model_id
         if ':countTokens' in model_id:
             clean_model_id = model_id.replace(':countTokens', '')
-            logger.info(f"Cleaned model ID: {model_id} -> {clean_model_id}")
+            logger.debug(f"Cleaned model ID: {model_id} -> {clean_model_id}")
         
         # 获取请求数据
         request_data = await request.json()
@@ -1366,14 +1951,18 @@ async def unified_gemini_count_tokens_endpoint(
             logger.error(f"No available channel found for API key: {mask_api_key(api_key)}")
             # 列出所有可用的渠道用于调试
             all_channels = channel_manager.get_all_channels()
-            logger.info(f"Available channels: {[(ch.custom_key, ch.provider) for ch in all_channels]}")
+            logger.debug(f"Available channels: {[(ch.custom_key, ch.provider) for ch in all_channels]}")
             raise HTTPException(status_code=503, detail="No available channels")
 
         effective_model_id = clean_model_id
         if channel.models_mapping:
             effective_model_id = channel.models_mapping.get(clean_model_id, clean_model_id)
             if effective_model_id != clean_model_id:
-                logger.info(f"Applying model mapping for countTokens: {clean_model_id} -> {effective_model_id}")
+                log_diagnose_event(
+                    logger,
+                    "Applying model mapping for countTokens",
+                    extra={"from": clean_model_id, "to": effective_model_id},
+                )
 
         count_request_data = {
             "model": effective_model_id,
@@ -1382,7 +1971,7 @@ async def unified_gemini_count_tokens_endpoint(
         
         logger.debug(f"Count tokens request data: {safe_log_request(count_request_data)}")
         
-        logger.info(f"Found channel: {channel.name} (provider: {channel.provider}, custom_key: {channel.custom_key})")
+        logger.debug(f"CountTokens channel resolved: name={channel.name}, provider={channel.provider}, custom_key={channel.custom_key}")
         
         # 根据渠道provider类型处理countTokens请求
         if channel.provider == "gemini":
@@ -1438,11 +2027,15 @@ async def handle_unified_request(request, api_key: str, source_format: str):
         is_streaming = request_data.get("stream", False)
 
         # 4. 记录请求入口日志
-        log_request_entry(
+        request_started_at = time.perf_counter()
+        request_headers = dict(request.headers)
+        request_url = str(request.url)
+        request_path = request.url.path if hasattr(request, "url") else None
+        request_id = log_request_entry(
             logger,
             request_method=request.method,
-            request_url=str(request.url),
-            request_headers=dict(request.headers),
+            request_url=request_url,
+            request_headers=request_headers,
             source_format=source_format,
             model=request_data.get("model"),
             is_streaming=is_streaming,
@@ -1457,7 +2050,11 @@ async def handle_unified_request(request, api_key: str, source_format: str):
                 channel=channel,
                 request_data=request_data,
                 source_format=source_format,
-                headers=dict(request.headers)
+                headers=request_headers,
+                request_started_at=request_started_at,
+                request_id=request_id,
+                request_method=request.method,
+                request_path=request_path,
             )
             
             return StreamingResponse(
@@ -1474,17 +2071,21 @@ async def handle_unified_request(request, api_key: str, source_format: str):
             )
         else:
             # 非流式请求
-            logger.debug(f"Input request data: {safe_log_request(request_data)}")
-            logger.debug("Processing non-streaming request")
+            log_diagnose_event(logger, "Input request data", extra={"body": safe_log_request(request_data)})
+            log_diagnose_event(logger, "Processing non-streaming request")
             response_data = await forward_request_to_channel(
                 channel=channel,
                 request_data=request_data,
                 source_format=source_format,
-                headers=dict(request.headers)
+                headers=request_headers,
+                request_started_at=request_started_at,
+                request_id=request_id,
+                request_method=request.method,
+                request_path=request_path,
             )
             
-            logger.debug(f"Final response data type: {type(response_data)}")
-            logger.debug(f"Final response data: {safe_log_response(response_data)}")
+            log_diagnose_event(logger, "Final response data type", extra={"type": str(type(response_data))})
+            log_diagnose_event(logger, "Final response data", extra={"body": safe_log_response(response_data)})
             
             # 使用JSONResponse确保正确的Content-Type和编码
             return JSONResponse(
@@ -1534,12 +2135,11 @@ async def handle_unified_request(request, api_key: str, source_format: str):
 
 async def handle_gemini_count_tokens(channel: ChannelInfo, model_id: str, request_data: dict):
     """处理Gemini渠道的countTokens请求"""
-    logger.info(f"Handling Gemini countTokens for model: {model_id}")
+    log_diagnose_event(logger, "Handling Gemini countTokens", extra={"model_id": model_id})
     
     # 构建countTokens的URL和请求
     count_tokens_url = f"{channel.base_url.rstrip('/')}/models/{model_id}:countTokens"
-    logger.info(f"Sending request to: {count_tokens_url}")
-    logger.info(f"Channel base_url: {channel.base_url}")
+    log_diagnose_event(logger, "Gemini countTokens upstream request", extra={"url": count_tokens_url, "base_url": channel.base_url})
     logger.debug(f"Using API key: {mask_api_key(channel.api_key)}")
     
     headers = {
@@ -1552,7 +2152,7 @@ async def handle_gemini_count_tokens(channel: ChannelInfo, model_id: str, reques
     else:
         count_tokens_url += f"?key={channel.api_key}"
         
-    logger.info(f"Final URL with API key: {count_tokens_url}")
+    logger.debug(f"Final URL with API key: {count_tokens_url}")
     
     # 发送请求到目标渠道
     async with get_http_client(channel, timeout=30.0) as client:
@@ -1570,7 +2170,7 @@ async def handle_gemini_count_tokens(channel: ChannelInfo, model_id: str, reques
             )
         
         result = response.json()
-        logger.info(f"Gemini count tokens response: {result}")
+        logger.debug(f"Gemini count tokens response: {result}")
         
         return JSONResponse(
             content=result,
@@ -1581,7 +2181,7 @@ async def handle_gemini_count_tokens(channel: ChannelInfo, model_id: str, reques
 
 async def handle_openai_count_tokens_for_gemini(channel: ChannelInfo, model_id: str, request_data: dict):
     """处理OpenAI渠道的countTokens请求，转换为Gemini格式响应"""
-    logger.info(f"Handling OpenAI countTokens for Gemini format request, model: {model_id}")
+    log_diagnose_event(logger, "Handling OpenAI countTokens for Gemini request", extra={"model_id": model_id})
 
     try:
         # 从Gemini格式的contents和systemInstruction提取文本用于token计数
@@ -1616,7 +2216,7 @@ async def handle_openai_count_tokens_for_gemini(channel: ChannelInfo, model_id: 
                                 # 假设每秒约 32 tokens, 默认估算 10 秒
                                 multimodal_token_estimate += 320
 
-        logger.info(f"Extracted text for token counting: {text_to_count[:200]}...")
+        logger.debug(f"Extracted text for token counting: {text_to_count[:200]}...")
         
         # 使用tiktoken计算token数量
         import tiktoken
@@ -1632,7 +2232,7 @@ async def handle_openai_count_tokens_for_gemini(channel: ChannelInfo, model_id: 
         
         # 计算token数量（文本 + 多模态估算）
         token_count = len(encoding.encode(text_to_count)) + multimodal_token_estimate
-        logger.info(f"Calculated token count: {token_count} (multimodal estimate: {multimodal_token_estimate})")
+        logger.debug(f"Calculated token count: {token_count} (multimodal estimate: {multimodal_token_estimate})")
 
         # 构建Gemini格式的响应
         gemini_response = {
@@ -1679,7 +2279,7 @@ async def handle_openai_count_tokens_for_gemini(channel: ChannelInfo, model_id: 
 
         # 简单估算：平均4个字符=1个token
         estimated_tokens = len(text_to_count) // 4 + multimodal_token_estimate
-        logger.info(f"Estimated token count (character-based): {estimated_tokens}")
+        logger.debug(f"Estimated token count (character-based): {estimated_tokens}")
 
         gemini_response = {
             "totalTokens": estimated_tokens
@@ -1698,7 +2298,7 @@ async def handle_openai_count_tokens_for_gemini(channel: ChannelInfo, model_id: 
 
 async def handle_anthropic_count_tokens_for_gemini(channel: ChannelInfo, model_id: str, request_data: dict):
     """处理Anthropic渠道的countTokens请求，转换为Gemini格式响应"""
-    logger.info(f"Handling Anthropic countTokens for Gemini format request, model: {model_id}")
+    log_diagnose_event(logger, "Handling Anthropic countTokens for Gemini request", extra={"model_id": model_id})
 
     try:
         # 从Gemini格式的contents和systemInstruction提取文本用于token计数
@@ -1730,14 +2330,14 @@ async def handle_anthropic_count_tokens_for_gemini(channel: ChannelInfo, model_i
                             elif mime_type.startswith("video/") or mime_type.startswith("audio/"):
                                 multimodal_token_estimate += 320
 
-        logger.info(f"Extracted text for token counting (Anthropic): {text_to_count[:200]}...")
+        logger.debug(f"Extracted text for token counting (Anthropic): {text_to_count[:200]}...")
 
         # Anthropic API没有专门的token计数端点，我们使用估算方法
         # Anthropic的token计算大致是：1 token ≈ 3.5个字符（英文）
         char_count = len(text_to_count)
         estimated_tokens = max(1, int(char_count / 3.5)) + multimodal_token_estimate
 
-        logger.info(f"Estimated token count for Anthropic (char-based): {estimated_tokens}")
+        logger.debug(f"Estimated token count for Anthropic (char-based): {estimated_tokens}")
 
         # 构建Gemini格式的响应
         gemini_response = {
@@ -1779,9 +2379,13 @@ async def handle_anthropic_count_tokens(request: Request, api_key: str):
         if channel.models_mapping:
             effective_model = channel.models_mapping.get(model, model)
             if effective_model != model:
-                logger.info(f"Model mapping applied: {model} -> {effective_model}")
+                log_diagnose_event(logger, "Anthropic count_tokens model mapping applied", extra={"from": model, "to": effective_model})
 
-        logger.info(f"Anthropic count_tokens request: model={model}, channel={channel.name}, provider={channel.provider}")
+        log_diagnose_event(
+            logger,
+            "Anthropic count_tokens request",
+            extra={"model": model, "channel": channel.name, "provider": channel.provider},
+        )
 
         # 4. 根据渠道类型处理
         if channel.provider == "anthropic":
@@ -1816,7 +2420,7 @@ async def _forward_anthropic_count_tokens(channel: ChannelInfo, request_data: di
     # 更新请求中的 model
     forward_data = {**request_data, "model": model}
 
-    logger.info(f"Forwarding count_tokens to Anthropic: {url}")
+    logger.debug(f"Forwarding count_tokens to Anthropic: {url}")
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(url, json=forward_data, headers=headers)
@@ -1826,7 +2430,7 @@ async def _forward_anthropic_count_tokens(channel: ChannelInfo, request_data: di
             raise HTTPException(status_code=response.status_code, detail=response.text)
 
         result = response.json()
-        logger.info(f"Anthropic count_tokens result: {result}")
+        logger.debug(f"Anthropic count_tokens result: {result}")
 
         return JSONResponse(
             content=result,
@@ -1856,7 +2460,7 @@ async def _estimate_tokens_with_tiktoken(request_data: dict, model: str):
         encoding = tiktoken.get_encoding("cl100k_base")
 
     token_count = len(encoding.encode(text_content))
-    logger.info(f"tiktoken estimated tokens: {token_count}")
+    logger.debug(f"tiktoken estimated tokens: {token_count}")
 
     return JSONResponse(
         content={"input_tokens": token_count},
@@ -1878,7 +2482,7 @@ async def _count_tokens_via_gemini(channel: ChannelInfo, request_data: dict, mod
 
     gemini_request = {"contents": gemini_contents}
 
-    logger.info(f"Forwarding count_tokens to Gemini: {url}")
+    logger.debug(f"Forwarding count_tokens to Gemini: {url}")
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(
@@ -1893,7 +2497,7 @@ async def _count_tokens_via_gemini(channel: ChannelInfo, request_data: dict, mod
 
         result = response.json()
         total_tokens = result.get("totalTokens", 0)
-        logger.info(f"Gemini countTokens result: {total_tokens}")
+        logger.debug(f"Gemini countTokens result: {total_tokens}")
 
         # 转换为 Anthropic 响应格式
         return JSONResponse(
@@ -1911,7 +2515,7 @@ async def _estimate_tokens_by_chars(request_data: dict):
     char_count = len(text_content)
     estimated_tokens = max(1, int(char_count / 3.5))
 
-    logger.info(f"Character-based token estimation: {char_count} chars -> {estimated_tokens} tokens")
+    logger.debug(f"Character-based token estimation: {char_count} chars -> {estimated_tokens} tokens")
 
     return JSONResponse(
         content={"input_tokens": estimated_tokens},
@@ -2047,11 +2651,12 @@ async def gateway_anthropic_count_tokens(request: Request):
     if config.model_mapping:
         effective_model = config.model_mapping.get(original_model, original_model)
         if effective_model != original_model:
-            logger.info(f"Gateway count_tokens model mapping: {original_model} -> {effective_model}")
+            log_diagnose_event(logger, "Gateway count_tokens model mapping", extra={"from": original_model, "to": effective_model})
 
-    logger.info(
-        f"Gateway count_tokens: provider={config.provider}, "
-        f"model={original_model}, effective_model={effective_model}"
+    log_diagnose_event(
+        logger,
+        "Gateway count_tokens request",
+        extra={"provider": config.provider, "model": original_model, "effective_model": effective_model},
     )
 
     try:
@@ -2147,9 +2752,15 @@ async def gateway_proxy(full_path: str, request: Request):
     else:
         api_key = extract_openai_api_key(authorization=request.headers.get("authorization"))
 
-    logger.info(
-        f"Gateway request: source={source_format}, target={config.provider}, "
-        f"path=/gateway/{full_path}, api_key={mask_api_key(api_key)}"
+    log_diagnose_event(
+        logger,
+        "Gateway request route",
+        extra={
+            "source": source_format,
+            "target": config.provider,
+            "path": f"/gateway/{full_path}",
+            "api_key": mask_api_key(api_key),
+        },
     )
 
     # 5. 基础校验
@@ -2165,9 +2776,15 @@ async def gateway_proxy(full_path: str, request: Request):
                 request_data = apply_suffix_to_request(
                     request_data, gw_suffix_result, source_format, config.provider
                 )
-                logger.info(
-                    f"Gateway 模型后缀解析: {raw_model} → base={gw_suffix_result.base_model}, "
-                    f"thinking={gw_suffix_result.thinking.mode}, max_tokens={gw_suffix_result.max_tokens}"
+                log_diagnose_event(
+                    logger,
+                    "Gateway 模型后缀解析",
+                    extra={
+                        "original_model": raw_model,
+                        "base_model": gw_suffix_result.base_model,
+                        "thinking": gw_suffix_result.thinking.mode,
+                        "max_tokens": gw_suffix_result.max_tokens,
+                    },
                 )
 
         model = request_data.get("model")
@@ -2202,8 +2819,7 @@ async def gateway_proxy(full_path: str, request: Request):
                 request_data["stream"] = True
     original_model = request_data.get("model")
 
-    # 简洁的请求信息日志
-    logger.info(f"📨 Gateway request: model={original_model}, format={source_format}->{config.provider}, streaming={is_streaming}")
+    # 简洁的请求信息日志由 log_request_entry 统一输出
 
     incoming_headers = dict(request.headers)
     incoming_query = dict(request.query_params)
@@ -2255,7 +2871,11 @@ async def gateway_proxy(full_path: str, request: Request):
     if has_body and config.model_mapping and isinstance(converted_data, dict):
         mapped = config.model_mapping.get(original_model) or config.model_mapping.get(converted_data.get("model"))
         if mapped:
-            logger.info(f"Gateway model mapping: {original_model} -> {mapped}")
+            log_diagnose_event(
+                logger,
+                "Gateway model mapping",
+                extra={"from": original_model, "to": mapped},
+            )
             converted_data["model"] = mapped
 
     # DEBUG: 打印转换后的完整请求 (仅在调试模式下)
@@ -2389,7 +3009,12 @@ async def gateway_proxy(full_path: str, request: Request):
                             )
                             raise HTTPException(status_code=status, detail=error_msg)
 
-                        logger.info(f"Gateway streaming upstream response: status={response.status_code}")
+                        log_diagnose_event(
+                            logger,
+                            "Gateway streaming upstream response",
+                            extra={"status": response.status_code},
+                            level=logging.INFO,
+                        )
                         logger.debug(
                             f"Gateway streaming upstream response headers: {safe_log_request(dict(response.headers))}"
                         )
@@ -2424,9 +3049,11 @@ async def gateway_proxy(full_path: str, request: Request):
                                 yield chunk
                         finally:
                             duration_ms = int((time.time() - started_at) * 1000)
-                            logger.info(
-                                f"Gateway streaming output summary: status=200, chunks={chunk_count}, "
-                                f"bytes={total_bytes}, duration_ms={duration_ms}"
+                            log_diagnose_event(
+                                logger,
+                                "Gateway streaming output summary",
+                                extra={"status": 200, "chunks": chunk_count, "bytes": total_bytes, "duration_ms": duration_ms},
+                                level=logging.INFO,
                             )
 
             return StreamingResponse(
@@ -2448,7 +3075,12 @@ async def gateway_proxy(full_path: str, request: Request):
                     headers=target_headers,
                 )
 
-            logger.info(f"Gateway upstream response: status={response.status_code}")
+            log_diagnose_event(
+                logger,
+                "Gateway upstream response",
+                extra={"status": response.status_code},
+                level=logging.INFO,
+            )
             logger.debug(
                 f"Gateway upstream response headers: {safe_log_request(dict(response.headers))}"
             )

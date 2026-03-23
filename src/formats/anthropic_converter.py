@@ -11,7 +11,7 @@ import re
 from .base_converter import BaseConverter, ConversionResult, ConversionError
 from .unified import UnifiedChatRequest, UnifiedChatResponse, UnifiedContent, UnifiedContentType
 from .unified.stream_state import StreamState, StreamPhase
-from src.utils.logger import log_structured_error, ERROR_TYPE_CONVERSION
+from src.utils.logger import log_structured_error, ERROR_TYPE_CONVERSION, log_diagnose_event
 
 # 全局工具状态管理器
 class ToolStateManager:
@@ -67,7 +67,7 @@ class AnthropicConverter(BaseConverter):
         
         # 如果没有提供budget_tokens，默认为high
         if budget_tokens is None:
-            self.logger.info("No budget_tokens provided, defaulting to reasoning_effort='high'")
+            self.logger.debug("No budget_tokens provided, defaulting to reasoning_effort='high'")
             return "high"
         
         # 从环境变量获取阈值配置（带默认值）
@@ -87,7 +87,11 @@ class AnthropicConverter(BaseConverter):
             else:
                 effort = "high"
             
-            self.logger.info(f"🎯 Budget tokens {budget_tokens} -> reasoning_effort '{effort}' (thresholds: low<={low_threshold}, high<={high_threshold})")
+            log_diagnose_event(
+                self.logger,
+                "Budget tokens mapped to reasoning_effort",
+                extra={"budget_tokens": budget_tokens, "effort": effort, "low_threshold": low_threshold, "high_threshold": high_threshold},
+            )
             return effort
             
         except ValueError as e:
@@ -184,6 +188,83 @@ class AnthropicConverter(BaseConverter):
             )
             return ConversionResult(success=False, error=str(e))
     
+    def _normalize_openai_tool_choice(self, tool_choice: Any) -> Any:
+        """将 Anthropic 风格 tool_choice 映射为 OpenAI 风格。"""
+        if not isinstance(tool_choice, dict):
+            return tool_choice
+
+        choice_type = tool_choice.get("type")
+        if choice_type == "auto":
+            return "auto"
+        if choice_type == "any":
+            return "required"
+        if choice_type == "tool":
+            tool_name = tool_choice.get("name", "")
+            if tool_name:
+                return {
+                    "type": "function",
+                    "function": {"name": tool_name},
+                }
+            return "required"
+        if choice_type == "none":
+            return "none"
+        return tool_choice
+
+    def _repair_unmatched_tool_calls(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """参考兼容代理策略，先尝试修补 tool 响应，再决定是否清理。"""
+        pending_names_by_id: Dict[str, str] = {}
+        for msg in messages:
+            if msg.get("role") == "assistant":
+                for tc in msg.get("tool_calls", []) or []:
+                    tool_call_id = tc.get("id")
+                    function_name = ((tc.get("function") or {}).get("name") or "").strip()
+                    if tool_call_id:
+                        pending_names_by_id[tool_call_id] = function_name
+
+        repaired_messages: List[Dict[str, Any]] = []
+        pending_ids = list(pending_names_by_id.keys())
+        patched_tool_messages = 0
+        ambiguous_tool_messages = 0
+
+        for msg in messages:
+            msg_copy = copy.deepcopy(msg)
+            if msg_copy.get("role") == "tool":
+                tool_call_id = (msg_copy.get("tool_call_id") or "").strip()
+                fallback_name = (msg_copy.get("name") or "").strip()
+
+                if not tool_call_id and fallback_name:
+                    matching_ids = [
+                        call_id for call_id, function_name in pending_names_by_id.items()
+                        if function_name and function_name == fallback_name and call_id in pending_ids
+                    ]
+                    if len(matching_ids) == 1:
+                        tool_call_id = matching_ids[0]
+                        msg_copy["tool_call_id"] = tool_call_id
+                        patched_tool_messages += 1
+                    elif len(matching_ids) > 1:
+                        ambiguous_tool_messages += 1
+
+                if not tool_call_id and len(pending_ids) == 1:
+                    tool_call_id = pending_ids[0]
+                    msg_copy["tool_call_id"] = tool_call_id
+                    patched_tool_messages += 1
+                elif not tool_call_id and len(pending_ids) > 1:
+                    ambiguous_tool_messages += 1
+
+                if tool_call_id in pending_ids:
+                    pending_ids.remove(tool_call_id)
+
+            repaired_messages.append(msg_copy)
+
+        if patched_tool_messages or ambiguous_tool_messages:
+            self.logger.info(
+                "Tool response compatibility repair: patched_tool_messages=%s, ambiguous_tool_messages=%s",
+                patched_tool_messages,
+                ambiguous_tool_messages,
+            )
+
+        return repaired_messages
+
     def _convert_to_openai_request(self, data: Dict[str, Any]) -> ConversionResult:
         """转换Anthropic请求到OpenAI格式（基于统一类型层）"""
         # 1) 使用 UnifiedChatRequest 解析 Anthropic 请求
@@ -210,10 +291,16 @@ class AnthropicConverter(BaseConverter):
         if "tools" in data:
             cleaned_tools: List[Dict[str, Any]] = []
             for tool in data.get("tools", []):
+                input_schema = (
+                    tool.get("input_schema")
+                    or tool.get("parameters")
+                    or tool.get("parametersJsonSchema")
+                    or {}
+                )
                 cleaned_tools.append({
                     "name": tool.get("name", ""),
                     "description": tool.get("description", ""),
-                    "input_schema": self._clean_json_schema_properties(tool.get("input_schema", {})),
+                    "input_schema": self._clean_json_schema_properties(input_schema),
                 })
             unified_request.tools = cleaned_tools
 
@@ -272,12 +359,12 @@ class AnthropicConverter(BaseConverter):
 
         # 5) tool_choice 兼容性处理
         if "tool_choice" in data:
-            result_data["tool_choice"] = data["tool_choice"]
+            result_data["tool_choice"] = self._normalize_openai_tool_choice(data["tool_choice"])
         elif "tools" in data and result_data.get("tools") and "tool_choice" not in result_data:
             result_data["tool_choice"] = "auto"
 
-        # 6) OpenAI 兼容性校验：确保所有 assistant.tool_calls 均有匹配的 tool 响应
-        messages = result_data.get("messages", [])
+        # 6) OpenAI 兼容性校验：先尝试修补，再确保所有 assistant.tool_calls 均有匹配的 tool 响应
+        messages = self._repair_unmatched_tool_calls(result_data.get("messages", []))
         validated_messages: List[Dict[str, Any]] = []
         for idx, msg in enumerate(messages):
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
@@ -292,8 +379,18 @@ class AnthropicConverter(BaseConverter):
                         break
 
                 if unmatched:
+                    unresolved_tool_messages = [
+                        later for later in messages[idx + 1:]
+                        if later.get("role") == "tool" and not later.get("tool_call_id")
+                    ]
                     self.logger.warning(
-                        f"Unmatched tool_call IDs without tool responses, cleaning: {list(unmatched)}"
+                        "Unmatched tool_call IDs without tool responses, cleaning: %s; "
+                        "assistant_message_index=%s, original_tool_call_count=%s, later_messages_checked=%s, unresolved_tool_messages=%s",
+                        list(unmatched),
+                        idx,
+                        len(call_ids),
+                        len(messages) - idx - 1,
+                        len(unresolved_tool_messages),
                     )
                     msg["tool_calls"] = [
                         tc for tc in msg.get("tool_calls", []) if tc.get("id") not in unmatched

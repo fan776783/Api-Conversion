@@ -93,29 +93,162 @@ class TestRequestConversion:
         }
 
         converter = _make_converter()
+        warnings = []
+
+        def _capture_warning(message, *args):
+            warnings.append(message % args if args else message)
+
+        converter.logger.warning = _capture_warning
         result = converter.convert_request(anthropic_request, target_format="openai")
         assert result.success is True
 
         assistant_msgs = [m for m in result.data["messages"] if m.get("role") == "assistant"]
         assert len(assistant_msgs) == 1
         assert "tool_calls" not in assistant_msgs[0]
+        assert len(warnings) == 1
+        assert "assistant_message_index=1" in warnings[0]
+        assert "original_tool_call_count=1" in warnings[0]
 
-    def test_with_tool_result_pair(self):
-        """Tool use + tool result pair should convert correctly."""
+    def test_repairs_tool_message_missing_tool_call_id_by_name(self):
+        """Tool message missing tool_call_id should be repaired by tool name when unambiguous."""
         anthropic_request = {
             "model": "claude-3-5",
             "messages": [
-                {"role": "user", "content": [{"type": "text", "text": "call"}]},
+                {"role": "user", "content": [{"type": "text", "text": "call tool"}]},
                 {
                     "role": "assistant",
                     "content": [
-                        {"type": "tool_use", "id": "call_1", "name": "tool", "input": {"x": 1}},
+                        {"type": "tool_use", "id": "call_1", "name": "Bash", "input": {"cmd": "pwd"}},
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "name": "Bash",
+                    "content": "ok",
+                },
+            ],
+        }
+
+        converter = _make_converter()
+        result = converter.convert_request(anthropic_request, target_format="openai")
+        assert result.success is True
+
+        tool_msgs = [m for m in result.data["messages"] if m.get("role") == "tool"]
+        assert len(tool_msgs) == 1
+        assert tool_msgs[0]["tool_call_id"] == "call_1"
+
+        assistant_msg = next(m for m in result.data["messages"] if m.get("role") == "assistant")
+        assert len(assistant_msg.get("tool_calls", [])) == 1
+
+    def test_repairs_tool_result_without_tool_use_id_when_single_candidate(self):
+        """单一候选时，缺失 tool_use_id 的 tool_result 应被唯一候选自动补齐。"""
+        anthropic_request = {
+            "model": "claude-3-5",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "run one tool"}]},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "call_only", "name": "Edit", "input": {"old_text": "a"}},
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "content": "validation failed",
+                },
+            ],
+        }
+
+        converter = _make_converter()
+        result = converter.convert_request(anthropic_request, target_format="openai")
+        assert result.success is True
+
+        tool_msg = next(m for m in result.data["messages"] if m.get("role") == "tool")
+        assert tool_msg["tool_call_id"] == "call_only"
+
+        assistant_msg = next(m for m in result.data["messages"] if m.get("role") == "assistant")
+        assert len(assistant_msg.get("tool_calls", [])) == 1
+
+    def test_does_not_bind_ambiguous_tool_result_without_tool_use_id(self):
+        """多个候选时，缺失 tool_use_id 的 tool_result 不应误绑定，应触发清理。"""
+        anthropic_request = {
+            "model": "claude-3-5",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "run tools"}]},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "call_1", "name": "Edit", "input": {"old_text": "a"}},
+                        {"type": "tool_use", "id": "call_2", "name": "Edit", "input": {"old_text": "b"}},
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "content": "validation failed",
+                },
+            ],
+        }
+
+        converter = _make_converter()
+        warnings = []
+
+        def _capture_warning(message, *args):
+            warnings.append(message % args if args else message)
+
+        converter.logger.warning = _capture_warning
+        result = converter.convert_request(anthropic_request, target_format="openai")
+        assert result.success is True
+
+        assistant_msg = next(m for m in result.data["messages"] if m.get("role") == "assistant")
+        assert "tool_calls" not in assistant_msg
+        assert assistant_msg["content"] == ""
+        assert len(warnings) == 1
+        assert "original_tool_call_count=2" in warnings[0]
+    def test_regression_schema_alias_wrong_args_and_repaired_tool_response(self):
+        """schema 别名回退后，错误参数名仍可透传，且缺失 tool_call_id 的工具响应可被修补。"""
+        anthropic_request = {
+            "model": "claude-3-5",
+            "tools": [
+                {
+                    "name": "Edit",
+                    "description": "edit text with schema alias",
+                    "parametersJsonSchema": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                        },
+                        "required": ["old_string", "new_string"],
+                    },
+                }
+            ],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "patch this file"}]},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call_edit_1",
+                            "name": "Edit",
+                            "input": {
+                                "old_text": "before",
+                                "new_text": "after",
+                            },
+                        }
                     ],
                 },
                 {
                     "role": "user",
                     "content": [
-                        {"type": "tool_result", "tool_use_id": "call_1", "content": "result"},
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_edit_1",
+                            "content": (
+                                "InputValidationError: required old_string/new_string missing; "
+                                "unexpected old_text/new_text"
+                            ),
+                        }
                     ],
                 },
             ],
@@ -125,13 +258,22 @@ class TestRequestConversion:
         result = converter.convert_request(anthropic_request, target_format="openai")
         assert result.success is True
 
-        messages = result.data["messages"]
-        assistant_msg = next(m for m in messages if m.get("role") == "assistant")
-        assert "tool_calls" in assistant_msg
-        assert len(assistant_msg["tool_calls"]) == 1
+        openai_req = result.data
+        function_def = openai_req["tools"][0]["function"]
+        assert function_def["parameters"]["required"] == ["old_string", "new_string"]
+        assert function_def["parametersJsonSchema"]["required"] == ["old_string", "new_string"]
 
-        tool_msg = next(m for m in messages if m.get("role") == "tool")
-        assert tool_msg["tool_call_id"] == "call_1"
+        assistant_msg = next(m for m in openai_req["messages"] if m.get("role") == "assistant")
+        assert len(assistant_msg.get("tool_calls", [])) == 1
+        assert json.loads(assistant_msg["tool_calls"][0]["function"]["arguments"]) == {
+            "old_text": "before",
+            "new_text": "after",
+        }
+
+        tool_msg = next(m for m in openai_req["messages"] if m.get("role") == "tool")
+        assert tool_msg["tool_call_id"] == "call_edit_1"
+        assert "old_string/new_string missing" in tool_msg["content"]
+
 
 
 class TestResponseConversion:

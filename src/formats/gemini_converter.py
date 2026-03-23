@@ -9,6 +9,8 @@ from threading import Lock
 import json
 import copy
 
+from src.utils.logger import log_diagnose_event
+
 from .base_converter import BaseConverter, ConversionResult, ConversionError
 
 
@@ -93,7 +95,7 @@ class GeminiConverter(BaseConverter):
         # 如果没有提供thinking_budget或为-1（动态思考），默认为high
         if thinking_budget is None or thinking_budget == -1:
             reason = "dynamic thinking (-1)" if thinking_budget == -1 else "no budget provided"
-            self.logger.info(f"No valid thinkingBudget ({reason}), defaulting to reasoning_effort='high'")
+            self.logger.debug(f"No valid thinkingBudget ({reason}), defaulting to reasoning_effort='high'")
             return "high"
         
         # 从环境变量获取阈值配置
@@ -120,7 +122,11 @@ class GeminiConverter(BaseConverter):
             else:
                 effort = "high"
             
-            self.logger.info(f"🎯 Thinking budget {thinking_budget} -> reasoning_effort '{effort}' (thresholds: low<={low_threshold}, high<={high_threshold})")
+            log_diagnose_event(
+                self.logger,
+                "Thinking budget mapped to reasoning_effort",
+                extra={"thinking_budget": thinking_budget, "effort": effort, "low_threshold": low_threshold, "high_threshold": high_threshold},
+            )
             return effort
             
         except ValueError as e:
