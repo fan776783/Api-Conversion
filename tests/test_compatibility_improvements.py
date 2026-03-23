@@ -100,6 +100,63 @@ def test_chat_streaming_tool_arguments_are_only_emitted_on_content_block_stop():
 
 
 
+def test_chat_streaming_prevents_old_new_string_intermediate_state_leakage():
+    """回归用户问题：Anthropic->OpenAI Chat 流式时不应提前泄漏半截 Edit 参数。"""
+    stream_id = "claude-3-5"
+    events = [
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "call_edit_1",
+                "name": "Edit",
+            },
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": '{"old_string":"same text",',
+            },
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": '"new_string":"same text"}',
+            },
+        },
+        {
+            "type": "content_block_stop",
+            "index": 0,
+        },
+    ]
+
+    results = [
+        convert_streaming_chunk("anthropic", OPENAI_CHAT_COMPLETIONS_FORMAT, event, stream_id)
+        for event in events
+    ]
+
+    first_delta = results[1].data["choices"][0]["delta"]
+    second_delta = results[2].data["choices"][0]["delta"]
+    final_delta = results[3].data["choices"][0]["delta"]
+
+    assert first_delta == {}
+    assert second_delta == {}
+
+    final_tool_call = final_delta["tool_calls"][0]
+    arguments = final_tool_call["function"]["arguments"]
+    assert json.loads(arguments) == {
+        "old_string": "same text",
+        "new_string": "same text",
+    }
+    assert final_tool_call["function"]["name"] == "Edit"
+
+
+
 def test_responses_streaming_emits_named_events_and_completed_payload():
     response_id_model = "claude-3-5"
     message_start = {
@@ -146,6 +203,71 @@ def test_responses_streaming_emits_named_events_and_completed_payload():
     completed_payload = completed.data[-1]
     assert '"status": "completed"' in completed_payload
     assert '"arguments": "{\\"old_string\\":\\"before\\"}"' in completed_payload
+
+
+
+def test_responses_stream_request_keeps_stream_flag_when_misdirected_to_chat_endpoint():
+    """回归用户问题：Responses 风格请求误投 chat 端点时，stream=true 不能丢。"""
+    payload = {
+        "model": "gpt-4.1",
+        "instructions": "你是一个代码助手",
+        "input": "修复这个问题",
+        "stream": True,
+        "max_output_tokens": 256,
+    }
+
+    detected = __import__("asyncio").run(detect_request_format(payload, "/v1/chat/completions"))
+    adapted = OpenAIResponsesRequestAdapter.adapt(payload)
+
+    assert detected == OPENAI_RESPONSES_FORMAT
+    assert adapted["stream"] is True
+    assert adapted["max_tokens"] == 256
+    assert adapted["messages"][0]["role"] == "system"
+    assert adapted["messages"][1] == {"role": "user", "content": "修复这个问题"}
+
+
+
+def test_responses_streaming_uses_response_events_not_chat_completion_chunks():
+    """回归用户问题：Responses 客户端不应再收到 chat.completion.chunk 风格事件。"""
+    response_id_model = "claude-3-5"
+    message_start = {
+        "type": "message_start",
+        "message": {
+            "id": "msg_1",
+            "model": response_id_model,
+            "usage": {"input_tokens": 8, "output_tokens": 0},
+        },
+    }
+    text_start = {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {
+            "type": "text",
+            "text": "",
+        },
+    }
+    text_delta = {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {
+            "type": "text_delta",
+            "text": "hello",
+        },
+    }
+    text_stop = {"type": "content_block_stop", "index": 0}
+    message_stop = {"type": "message_stop"}
+
+    outputs = []
+    for event in (message_start, text_start, text_delta, text_stop, message_stop):
+        result = convert_streaming_chunk("anthropic", OPENAI_RESPONSES_FORMAT, event, response_id_model)
+        outputs.extend(result.data)
+
+    joined = "\n".join(outputs)
+    assert "event: response.created" in joined
+    assert "event: response.output_text.delta" in joined
+    assert "event: response.completed" in joined
+    assert "chat.completion.chunk" not in joined
+    assert "data: [DONE]" not in joined
 
 
 

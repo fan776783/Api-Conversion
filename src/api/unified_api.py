@@ -60,6 +60,8 @@ def resolve_openai_subprotocol(request_path: Optional[str], request_data: Dict[s
     path = request_path or ""
     if path.endswith("/v1/responses") or "/responses" in path:
         return OPENAI_RESPONSES_FORMAT
+    if path.endswith("/v1/chat/completions") or "/chat/completions" in path:
+        return OPENAI_CHAT_COMPLETIONS_FORMAT
     if isinstance(request_data, dict) and OpenAIResponsesRequestAdapter.looks_like_responses_request(request_data):
         return OPENAI_RESPONSES_FORMAT
     return OPENAI_CHAT_COMPLETIONS_FORMAT
@@ -2043,10 +2045,19 @@ async def handle_unified_request(request, api_key: str, source_format: str):
         # 2. 获取请求数据
         request_data = await request.json()
         request_path = request.url.path if hasattr(request, "url") else None
+        original_source_format = source_format
         if source_format in {"openai", OPENAI_CHAT_COMPLETIONS_FORMAT, OPENAI_RESPONSES_FORMAT}:
-            source_format = resolve_openai_subprotocol(request_path, request_data)
-            if source_format == OPENAI_CHAT_COMPLETIONS_FORMAT and OpenAIResponsesRequestAdapter.looks_like_responses_request(request_data):
-                request_data = OpenAIResponsesRequestAdapter.adapt(request_data)
+            detected_subprotocol = resolve_openai_subprotocol(request_path, request_data)
+            if original_source_format == OPENAI_CHAT_COMPLETIONS_FORMAT:
+                source_format = OPENAI_CHAT_COMPLETIONS_FORMAT
+                if OpenAIResponsesRequestAdapter.looks_like_responses_request(request_data):
+                    request_data = OpenAIResponsesRequestAdapter.adapt(request_data)
+            elif original_source_format == OPENAI_RESPONSES_FORMAT:
+                source_format = OPENAI_RESPONSES_FORMAT
+            else:
+                source_format = detected_subprotocol
+                if source_format == OPENAI_CHAT_COMPLETIONS_FORMAT and OpenAIResponsesRequestAdapter.looks_like_responses_request(request_data):
+                    request_data = OpenAIResponsesRequestAdapter.adapt(request_data)
 
         # 3. 验证必须字段
         if not request_data.get("model"):
@@ -2763,11 +2774,28 @@ async def gateway_proxy(full_path: str, request: Request):
     detect_path = "/" + full_path if full_path else ""
     try:
         source_format = await detect_request_format(request_data, path=detect_path)
+        if source_format in {"openai", OPENAI_CHAT_COMPLETIONS_FORMAT, OPENAI_RESPONSES_FORMAT}:
+            resolved_subprotocol = resolve_openai_subprotocol(detect_path, request_data if isinstance(request_data, dict) else {})
+            if resolved_subprotocol == OPENAI_CHAT_COMPLETIONS_FORMAT:
+                source_format = OPENAI_CHAT_COMPLETIONS_FORMAT
+                if isinstance(request_data, dict) and OpenAIResponsesRequestAdapter.looks_like_responses_request(request_data):
+                    request_data = OpenAIResponsesRequestAdapter.adapt(request_data)
+            else:
+                source_format = OPENAI_RESPONSES_FORMAT
+
         source_canonical = canonical_format_name(source_format)
-        provider_canonical = canonical_format_name(config.provider)
+        target_format = (
+            source_format
+            if config.provider == "openai" and source_canonical in {OPENAI_CHAT_COMPLETIONS_FORMAT, OPENAI_RESPONSES_FORMAT}
+            else config.provider
+        )
+        target_canonical = canonical_format_name(target_format)
     except Exception as e:
         logger.warning(f"Failed to detect request format: {e}, defaulting to openai")
         source_format = "openai"
+        source_canonical = canonical_format_name(source_format)
+        target_format = config.provider
+        target_canonical = canonical_format_name(target_format)
 
     # 3.1 Gemini 格式：从 URL 路径中提取 model（Gemini 请求的 model 在 URL 而非请求体中）
     if source_format == "gemini" and isinstance(request_data, dict) and not request_data.get("model"):
@@ -2888,7 +2916,7 @@ async def gateway_proxy(full_path: str, request: Request):
 
     # 7. 请求格式转换（仅对有 JSON 请求体的方法）
     if has_body:
-        if source_canonical == provider_canonical:
+        if source_canonical == target_canonical:
             converted_data = request_data.copy()
             # Gemini 不接受请求体中的 stream 字段
             if config.provider == "gemini":
@@ -2896,7 +2924,7 @@ async def gateway_proxy(full_path: str, request: Request):
         else:
             conversion_result = convert_request(
                 source_format,
-                config.provider,
+                target_format,
                 request_data,
                 headers=incoming_headers,
             )
@@ -2975,10 +3003,10 @@ async def gateway_proxy(full_path: str, request: Request):
         else:
             path = "/" + full_path.lstrip("/") if full_path else ""
             url = f"{base}{path}"
-    elif request.method in ("POST", "PUT") and source_canonical != provider_canonical:
+    elif request.method in ("POST", "PUT") and source_canonical != target_canonical:
         # 跨格式转换：使用目标 provider 的规范端点
         if config.provider == "openai":
-            url = f"{base}/v1/responses" if source_canonical == OPENAI_RESPONSES_FORMAT else f"{base}/v1/chat/completions"
+            url = f"{base}/v1/responses" if target_canonical == OPENAI_RESPONSES_FORMAT else f"{base}/v1/chat/completions"
         elif config.provider == "anthropic":
             url = f"{base}/v1/messages"
         else:
@@ -3160,8 +3188,8 @@ async def gateway_proxy(full_path: str, request: Request):
             logger.debug(f"Gateway upstream response body: {safe_log_response(response_data)}")
 
             # 响应格式转换（仅对 POST / PUT 做格式转换）
-            if has_body and source_canonical != provider_canonical:
-                response_result = convert_response(config.provider, source_format, response_data)
+            if has_body and source_canonical != target_canonical:
+                response_result = convert_response(target_format, source_format, response_data)
                 if response_result.success:
                     response_data = response_result.data
 
