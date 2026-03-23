@@ -22,6 +22,7 @@ from formats.converter_factory import (
     OPENAI_CHAT_COMPLETIONS_FORMAT,
     OPENAI_RESPONSES_FORMAT,
 )
+from formats.openai_responses_request_adapter import OpenAIResponsesRequestAdapter
 from src.utils.logger import (
     setup_logger,
     log_observe_request_done,
@@ -38,6 +39,11 @@ from src.utils.exceptions import ChannelNotFoundError, ConversionError, APIError
 from src.utils.http_client import get_http_client
 from src.core.gateway_config import (
     GatewayConfig, load_gateway_config, save_gateway_config, delete_gateway_config
+)
+from src.core.protocol_resolution import (
+    detect_client_format,
+    resolve_protocol_context,
+    get_openai_protocol_options,
 )
 
 logger = setup_logger("conversion_api")
@@ -74,6 +80,8 @@ class ChannelCreateRequest(BaseModel):
     max_retries: int = Field(3, description="最大重试次数")
     # 新增：模型映射（请求模型名 -> 映射模型名）
     models_mapping: Optional[Dict[str, str]] = None
+    default_target_format: Optional[str] = None
+    supported_formats: Optional[List[str]] = None
     payload_config: Optional[Dict[str, Any]] = None
     use_proxy: Optional[bool] = None
     proxy_type: Optional[str] = None
@@ -93,6 +101,8 @@ class ChannelUpdateRequest(BaseModel):
     max_retries: Optional[int] = None
     enabled: Optional[bool] = None
     models_mapping: Optional[Dict[str, str]] = None
+    default_target_format: Optional[str] = None
+    supported_formats: Optional[List[str]] = None
     payload_config: Optional[Dict[str, Any]] = None
     use_proxy: Optional[bool] = None
     proxy_type: Optional[str] = None
@@ -104,36 +114,9 @@ class ChannelUpdateRequest(BaseModel):
 
 async def detect_request_format(request_data: Dict[str, Any], path: str) -> str:
     """检测请求格式"""
-    # 基于请求数据结构优先识别 Responses 风格，支持误投到 /chat/completions 的场景
-    if isinstance(request_data, dict):
-        has_responses_shape = (
-            "messages" not in request_data
-            and any(key in request_data for key in ("input", "instructions", "max_output_tokens", "previous_response_id"))
-        )
-        if has_responses_shape:
-            return "openai_responses"
-
-    # 基于URL路径检测
-    if "/openai/" in path or path.endswith("/chat/completions"):
-        return "openai_chat_completions"
-    elif path.endswith("/responses") or "/v1/responses" in path:
-        return "openai_responses"
-    elif "/anthropic/" in path or path.endswith("/messages") or "/v1/messages" in path:
-        # Anthropic: /anthropic/ 前缀，或以 /messages 结尾，或包含 /v1/messages（如 /v1/messages/count_tokens）
-        return "anthropic"
-    elif "/gemini/" in path or "generateContent" in path:
-        return "gemini"
-
-    if "messages" in request_data and "model" in request_data:
-        if "system" in request_data:
-            return "anthropic"
-        else:
-            return "openai_chat_completions"
-    elif "contents" in request_data:
-        return "gemini"
-
-    # 默认返回openai chat格式
-    return "openai_chat_completions"
+    if isinstance(request_data, dict) and OpenAIResponsesRequestAdapter.looks_like_responses_request(request_data):
+        return OPENAI_RESPONSES_FORMAT
+    return detect_client_format(request_data, path)
 
 
 
@@ -141,6 +124,7 @@ async def forward_request(
     channel: ChannelInfo,
     converted_data: Dict[str, Any],
     headers: Dict[str, str],
+    target_format: str,
     method: str = "POST"
 ) -> Dict[str, Any]:
     """转发请求到目标API"""
@@ -166,7 +150,8 @@ async def forward_request(
         log_diagnose_event(logger, "Failed to apply model mapping", extra={"error": str(e)}, level=logging.WARNING)
     # 构建请求URL
     if channel.provider == "openai":
-        if target_format == "openai_responses":
+        canonical_target = canonical_format_name(target_format)
+        if canonical_target == OPENAI_RESPONSES_FORMAT:
             url = f"{channel.base_url.rstrip('/')}/responses"
         else:
             url = f"{channel.base_url.rstrip('/')}/chat/completions"
@@ -279,6 +264,8 @@ async def create_channel(request: ChannelCreateRequest, _: bool = Depends(get_se
             timeout=request.timeout,
             max_retries=request.max_retries,
             models_mapping=request.models_mapping,
+            default_target_format=request.default_target_format,
+            supported_formats=request.supported_formats,
             payload_config=request.payload_config,
             use_proxy=request.use_proxy,
             proxy_type=request.proxy_type,
@@ -317,6 +304,8 @@ async def list_channels(_: bool = Depends(get_session_user)):
                     "max_retries": getattr(channel, 'max_retries', 3),
                     "enabled": channel.enabled,
                     "models_mapping": getattr(channel, 'models_mapping', None),
+                    "default_target_format": getattr(channel, 'default_target_format', None),
+                    "supported_formats": getattr(channel, 'supported_formats', None),
                     "payload_config": getattr(channel, 'payload_config', None),
                     # 代理配置
                     "proxy_host": getattr(channel, 'proxy_host', None),
@@ -357,6 +346,8 @@ async def get_channel(channel_id: str, _: bool = Depends(get_session_user)):
                 "max_retries": getattr(channel, 'max_retries', 3),
                 "enabled": channel.enabled,
                 "models_mapping": getattr(channel, 'models_mapping', None),
+                "default_target_format": getattr(channel, 'default_target_format', None),
+                "supported_formats": getattr(channel, 'supported_formats', None),
                 "payload_config": getattr(channel, 'payload_config', None),
                 # 代理配置
                 "proxy_host": getattr(channel, 'proxy_host', None),
@@ -390,6 +381,8 @@ async def update_channel(channel_id: str, request: ChannelUpdateRequest, _: bool
             max_retries=request.max_retries,
             enabled=request.enabled,
             models_mapping=request.models_mapping,
+            default_target_format=request.default_target_format,
+            supported_formats=request.supported_formats,
             payload_config=request.payload_config,
             use_proxy=request.use_proxy,
             proxy_type=request.proxy_type,
@@ -486,8 +479,16 @@ async def handle_conversion_request(request: Request, target_format: str):
         headers = dict(request_headers)
         input_chars = _count_payload_chars(request_data)
 
-        # 检测源格式
-        source_format = await detect_request_format(request_data, str(request.url.path))
+        protocol_context = resolve_protocol_context(
+            request_data=request_data,
+            request_path=str(request.url.path),
+            target_provider=canonical_format_name(target_format) if canonical_format_name(target_format) not in {OPENAI_CHAT_COMPLETIONS_FORMAT, OPENAI_RESPONSES_FORMAT} else "openai",
+            explicit_client_format=target_format if target_format in {OPENAI_CHAT_COMPLETIONS_FORMAT, OPENAI_RESPONSES_FORMAT} else None,
+        )
+        source_format = protocol_context.client_format
+        normalized_request_data = protocol_context.normalized_request_data
+        resolved_target_format = protocol_context.target_format
+        provider_name = "openai" if canonical_format_name(resolved_target_format) in {OPENAI_CHAT_COMPLETIONS_FORMAT, OPENAI_RESPONSES_FORMAT} else resolved_target_format
 
         log_diagnose_event(
             logger,
@@ -495,25 +496,26 @@ async def handle_conversion_request(request: Request, target_format: str):
             extra={
                 "path": request.url.path,
                 "source_format": source_format,
-                "target_format": target_format,
+                "target_format": resolved_target_format,
+                "provider": provider_name,
             },
         )
-        
+
         # 如果源格式和目标格式同属同一协议族，直接转发
-        if canonical_format_name(source_format) == canonical_format_name(target_format):
-            # 根据目标格式找到合适的渠道
-            channels = channel_manager.get_channels_by_provider(target_format)
+        if canonical_format_name(source_format) == canonical_format_name(resolved_target_format):
+            # 根据目标 provider 找到合适的渠道
+            channels = channel_manager.get_channels_by_provider(provider_name)
             if not channels:
                 raise HTTPException(
                     status_code=503,
-                    detail=f"No available {target_format} channels configured"
+                    detail=f"No available {provider_name} channels configured"
                 )
-            
+
             # 选择第一个可用渠道
             channel = channels[0]
-            
+
             # 直接转发请求
-            response_data = await forward_request(channel, request_data, headers)
+            response_data = await forward_request(channel, normalized_request_data, headers, resolved_target_format)
             log_observe_request_done(
                 logger,
                 request_id=request_id,
@@ -523,8 +525,8 @@ async def handle_conversion_request(request: Request, target_format: str):
                 channel_name=channel.name,
                 channel_provider=channel.provider,
                 upstream_url=sanitize_url_for_log(channel.base_url),
-                client_model=request_data.get("model"),
-                upstream_model=request_data.get("model"),
+                client_model=normalized_request_data.get("model"),
+                upstream_model=normalized_request_data.get("model"),
                 is_streaming=False,
                 status_code=200,
                 duration_ms=round((time.perf_counter() - request_started_at) * 1000, 2),
@@ -535,7 +537,7 @@ async def handle_conversion_request(request: Request, target_format: str):
             return response_data
         
         # 格式转换
-        conversion_result = convert_request(source_format, target_format, request_data, headers)
+        conversion_result = convert_request(source_format, resolved_target_format, normalized_request_data, headers)
         
         if not conversion_result.success:
             raise HTTPException(
@@ -543,22 +545,22 @@ async def handle_conversion_request(request: Request, target_format: str):
                 detail=f"Request conversion failed: {conversion_result.error}"
             )
         
-        # 找到目标格式的渠道
-        channels = channel_manager.get_channels_by_provider(target_format)
+        # 找到目标 provider 的渠道
+        channels = channel_manager.get_channels_by_provider(provider_name)
         if not channels:
             raise HTTPException(
                 status_code=503,
-                detail=f"No available {target_format} channels configured"
+                detail=f"No available {provider_name} channels configured"
             )
         
         # 选择第一个可用渠道
         channel = channels[0]
         
         # 转发请求
-        response_data = await forward_request(channel, conversion_result.data, headers)
+        response_data = await forward_request(channel, conversion_result.data, headers, resolved_target_format)
 
         # 转换响应格式
-        response_conversion_result = convert_response(source_format, target_format, response_data)
+        response_conversion_result = convert_response(resolved_target_format, source_format, response_data)
 
         if not response_conversion_result.success:
             logger.warning(f"Response conversion failed: {response_conversion_result.error}")
@@ -571,7 +573,7 @@ async def handle_conversion_request(request: Request, target_format: str):
                 channel_name=channel.name,
                 channel_provider=channel.provider,
                 upstream_url=sanitize_url_for_log(channel.base_url),
-                client_model=request_data.get("model"),
+                client_model=normalized_request_data.get("model") if isinstance(normalized_request_data, dict) else request_data.get("model"),
                 upstream_model=conversion_result.data.get("model") if isinstance(conversion_result.data, dict) else request_data.get("model"),
                 is_streaming=False,
                 status_code=200,
@@ -650,7 +652,8 @@ async def get_supported_formats():
     """获取支持的格式列表"""
     return {
         "success": True,
-        "formats": ConverterFactory.get_supported_formats()
+        "formats": ConverterFactory.get_supported_formats(),
+        "openai_protocol_options": get_openai_protocol_options(),
     }
 
 
@@ -818,6 +821,8 @@ class GatewayConfigRequest(BaseModel):
     timeout: int = Field(30, description="超时时间（秒）", ge=1, le=600)
     max_retries: int = Field(1, description="最大重试次数", ge=0, le=10)
     model_mapping: Optional[Dict[str, str]] = Field(default=None, description="模型映射")
+    default_target_format: Optional[str] = Field(default=None, description="默认目标协议")
+    supported_formats: Optional[List[str]] = Field(default=None, description="支持的目标协议列表")
     enabled: bool = Field(True, description="是否启用 Gateway")
 
 
@@ -858,6 +863,8 @@ async def upsert_gateway_config(
             timeout=request.timeout,
             max_retries=request.max_retries,
             model_mapping=request.model_mapping or {},
+            default_target_format=request.default_target_format,
+            supported_formats=request.supported_formats or [],
             enabled=request.enabled,
         )
         save_gateway_config(config)

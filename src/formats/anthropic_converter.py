@@ -117,7 +117,7 @@ class AnthropicConverter(BaseConverter):
     
     def get_supported_formats(self) -> List[str]:
         """获取支持的格式列表"""
-        return ["openai", "anthropic", "gemini"]
+        return ["openai", "openai_chat_completions", "anthropic", "gemini"]
     
     def convert_request(
         self,
@@ -130,7 +130,7 @@ class AnthropicConverter(BaseConverter):
             if target_format == "anthropic":
                 # Anthropic到Anthropic，格式与渠道相同，不需要转换思考参数
                 return ConversionResult(success=True, data=data)
-            elif target_format == "openai":
+            elif target_format in {"openai", "openai_chat_completions"}:
                 return self._convert_to_openai_request(data)
             elif target_format == "gemini":
                 return self._convert_to_gemini_request(data)

@@ -4,16 +4,24 @@ class APIConverter {
         this.currentTaskId = null;
         this.progressInterval = null;
         this.channels = [];
+        this.openaiProtocolOptions = [];
         this.init();
     }
 
-    init() {
+    async init() {
         this.setupEventListeners();
         this.setupTabNavigation();
+        await this.loadFormatOptions();
         this.loadProviders();
         this.loadCapabilities();
         this.loadChannels();
         this.setupModernAnimations();
+        syncOpenAITargetFormatVisibility(
+            'channel_provider',
+            'target-format-section',
+            'default_target_format',
+            'supported_formats'
+        );
         // 初始模型下拉同步
         const providerSelect = document.getElementById('provider');
         if (providerSelect) {
@@ -61,6 +69,12 @@ class APIConverter {
         if (document.getElementById('channel_provider')) {
             document.getElementById('channel_provider').addEventListener('change', (e) => {
                 this.updateChannelDefaultUrl(e.target.value);
+                syncOpenAITargetFormatVisibility(
+                    'channel_provider',
+                    'target-format-section',
+                    'default_target_format',
+                    'supported_formats'
+                );
             });
         }
 
@@ -208,6 +222,23 @@ class APIConverter {
             // 处理能力选项
         } catch (error) {
             console.error('Failed to load capabilities:', error);
+        }
+    }
+
+    async loadFormatOptions() {
+        try {
+            const response = await fetch('/api/conversion/formats', {
+                credentials: 'same-origin'
+            });
+            const data = await response.json();
+            this.openaiProtocolOptions = Array.isArray(data.openai_protocol_options)
+                ? data.openai_protocol_options
+                : [];
+            renderOpenAIProtocolOptions(this.openaiProtocolOptions);
+        } catch (error) {
+            console.error('Failed to load format options:', error);
+            this.openaiProtocolOptions = [];
+            renderOpenAIProtocolOptions([]);
         }
     }
 
@@ -591,6 +622,20 @@ class APIConverter {
             channelData.models_mapping = mapping;
         }
 
+        if (channelData.provider === 'openai') {
+            const defaultTargetFormat = document.getElementById('default_target_format')?.value || '';
+            const supportedFormats = getSelectedValues('supported_formats');
+            if (defaultTargetFormat) {
+                channelData.default_target_format = defaultTargetFormat;
+            }
+            if (supportedFormats.length > 0) {
+                channelData.supported_formats = supportedFormats;
+            }
+        } else {
+            delete channelData.default_target_format;
+            delete channelData.supported_formats;
+        }
+
         try {
             if (submitBtn) {
                 submitBtn.disabled = true;
@@ -682,6 +727,13 @@ class APIConverter {
                 ? `<p><strong>模型映射:</strong> ${mappingCount} 条</p>`
                 : '';
 
+            const formatSummary = channel.default_target_format || (Array.isArray(channel.supported_formats) && channel.supported_formats.length > 0
+                ? channel.supported_formats.join(', ')
+                : '未声明');
+            const supportedSummary = Array.isArray(channel.supported_formats) && channel.supported_formats.length > 0
+                ? `<p><strong>支持协议:</strong> ${channel.supported_formats.join(', ')}</p>`
+                : '';
+
             return `
             <div class="channel-item ${channel.enabled ? 'enabled' : 'disabled'}">
                 <div class="channel-info">
@@ -691,6 +743,7 @@ class APIConverter {
                     <p><strong>自定义Key:</strong> <code class="copyable pill" data-copy="${channel.custom_key}" title="点击复制" tabindex="0">${channel.custom_key}</code></p>
                     <p><strong>代理:</strong> ${proxyInfo}</p>
                     <p><strong>状态:</strong> <span class="status-chip ${channel.enabled ? 'enabled' : 'disabled'}">${channel.enabled ? '启用' : '禁用'}</span></p>
+                    ${channel.provider === 'openai' ? `<p><strong>默认目标协议:</strong> ${formatSummary}</p>${supportedSummary}` : ''}
                     ${mappingSummary}
                     <p><small>创建时间: ${new Date(channel.created_at).toLocaleString()}</small></p>
                 </div>
@@ -834,6 +887,14 @@ class APIConverter {
         document.getElementById('custom_key').value = channel.custom_key || '';
         document.getElementById('timeout').value = channel.timeout || 30;
         document.getElementById('max_retries').value = channel.max_retries || 3;
+        document.getElementById('default_target_format').value = channel.default_target_format || '';
+        setSelectedValues('supported_formats', channel.supported_formats || []);
+        syncOpenAITargetFormatVisibility(
+            'channel_provider',
+            'target-format-section',
+            'default_target_format',
+            'supported_formats'
+        );
 
         // 填充模型映射
         this.setMappingRows(channel.models_mapping || {});
@@ -945,6 +1006,14 @@ class APIConverter {
 
         // 重置代理配置
         document.getElementById('use_proxy').checked = false;
+        document.getElementById('default_target_format').value = '';
+        setSelectedValues('supported_formats', []);
+        syncOpenAITargetFormatVisibility(
+            'channel_provider',
+            'target-format-section',
+            'default_target_format',
+            'supported_formats'
+        );
         const proxyPasswordInput = document.getElementById('proxy_password');
         proxyPasswordInput.placeholder = '';
         proxyPasswordInput.type = 'password';
@@ -1013,6 +1082,14 @@ class APIConverter {
         const mapping = this.collectModelMapping({ forceIfPresent: true });
         if (mapping !== null) {
             channelData.models_mapping = mapping; // 空对象 {} 将清空已有映射
+        }
+
+        if (channelData.provider === 'openai') {
+            channelData.default_target_format = document.getElementById('default_target_format')?.value || null;
+            channelData.supported_formats = getSelectedValues('supported_formats');
+        } else {
+            channelData.default_target_format = null;
+            channelData.supported_formats = [];
         }
 
         try {
@@ -1439,6 +1516,8 @@ function initializeApp() {
     document.addEventListener('mousedown', () => {
         document.body.classList.remove('keyboard-navigation');
     });
+
+    setTimeout(initGatewayConfig, 50);
 }
 
 // 如果页面已经加载完成，直接初始化；否则等待DOMContentLoaded
@@ -1577,13 +1656,92 @@ function normalizeImportedModelMapping(payload) {
     return mapping;
 }
 
+function getSelectedValues(selectId) {
+    const select = document.getElementById(selectId);
+    if (!select) return [];
+    return Array.from(select.selectedOptions || []).map(option => option.value).filter(Boolean);
+}
+
+function setSelectedValues(selectId, values) {
+    const select = document.getElementById(selectId);
+    if (!select) return;
+    const selectedSet = new Set(Array.isArray(values) ? values : []);
+    Array.from(select.options || []).forEach(option => {
+        option.selected = selectedSet.has(option.value);
+    });
+}
+
+function syncOpenAITargetFormatVisibility(providerSelectId, sectionId, defaultFieldId, supportedFieldId) {
+    const providerSelect = document.getElementById(providerSelectId);
+    const section = document.getElementById(sectionId);
+    if (!providerSelect || !section) return;
+
+    const isOpenAI = providerSelect.value === 'openai';
+    section.style.display = isOpenAI ? 'block' : 'none';
+
+    if (!isOpenAI) {
+        const defaultField = document.getElementById(defaultFieldId);
+        if (defaultField) {
+            defaultField.value = '';
+        }
+        setSelectedValues(supportedFieldId, []);
+    }
+}
+
+function populateSelectOptions(selectId, options, { includeAutoOption = false, multiple = false } = {}) {
+    const select = document.getElementById(selectId);
+    if (!select) return;
+
+    const previousValues = multiple
+        ? getSelectedValues(selectId)
+        : [select.value].filter(Boolean);
+
+    select.innerHTML = '';
+    if (includeAutoOption) {
+        const autoOption = document.createElement('option');
+        autoOption.value = '';
+        autoOption.textContent = '跟随客户端请求 / 自动解析';
+        select.appendChild(autoOption);
+    }
+
+    (options || []).forEach(option => {
+        const item = document.createElement('option');
+        item.value = option.value;
+        item.textContent = option.label || option.value;
+        select.appendChild(item);
+    });
+
+    if (multiple) {
+        setSelectedValues(selectId, previousValues);
+    } else {
+        select.value = previousValues[0] || '';
+    }
+}
+
+function renderOpenAIProtocolOptions(options) {
+    populateSelectOptions('default_target_format', options, { includeAutoOption: true, multiple: false });
+    populateSelectOptions('supported_formats', options, { includeAutoOption: false, multiple: true });
+    populateSelectOptions('gateway_default_target_format', options, { includeAutoOption: true, multiple: false });
+    populateSelectOptions('gateway_supported_formats', options, { includeAutoOption: false, multiple: true });
+}
+
 
 // ============ Gateway 配置管理 ============
 
 // 初始化 Gateway 配置
 async function initGatewayConfig() {
+    if (window.__gatewayConfigInitialized) {
+        return;
+    }
+    window.__gatewayConfigInitialized = true;
     await loadGatewayConfig();
     setupGatewayForm();
+    syncOpenAITargetFormatVisibility(
+        'gateway_provider',
+        'gateway-target-format-section',
+        'gateway_default_target_format',
+        'gateway_supported_formats'
+    );
 }
 
 // 加载 Gateway 配置
@@ -1607,6 +1765,14 @@ async function loadGatewayConfig() {
             document.getElementById('gateway_timeout').value = data.config.timeout || 30;
             document.getElementById('gateway_max_retries').value = data.config.max_retries || 1;
             document.getElementById('gateway_enabled').checked = data.config.enabled !== false;
+            document.getElementById('gateway_default_target_format').value = data.config.default_target_format || '';
+            setSelectedValues('gateway_supported_formats', data.config.supported_formats || []);
+            syncOpenAITargetFormatVisibility(
+                'gateway_provider',
+                'gateway-target-format-section',
+                'gateway_default_target_format',
+                'gateway_supported_formats'
+            );
 
             // 填充模型映射
             const mapping = data.config.model_mapping || {};
@@ -1616,6 +1782,14 @@ async function loadGatewayConfig() {
             statusBadge.textContent = '未配置';
             statusBadge.className = 'status-badge status-unconfigured';
             deleteBtn.style.display = 'none';
+            document.getElementById('gateway_default_target_format').value = '';
+            setSelectedValues('gateway_supported_formats', []);
+            syncOpenAITargetFormatVisibility(
+                'gateway_provider',
+                'gateway-target-format-section',
+                'gateway_default_target_format',
+                'gateway_supported_formats'
+            );
         }
     } catch (error) {
         console.error('Failed to load gateway config:', error);
@@ -1645,6 +1819,12 @@ function setupGatewayForm() {
             if (defaultUrls[e.target.value] && urlInput && !urlInput.value) {
                 urlInput.value = defaultUrls[e.target.value];
             }
+            syncOpenAITargetFormatVisibility(
+                'gateway_provider',
+                'gateway-target-format-section',
+                'gateway_default_target_format',
+                'gateway_supported_formats'
+            );
         });
     }
 
@@ -1668,8 +1848,15 @@ async function saveGatewayConfig() {
         timeout: parseInt(document.getElementById('gateway_timeout').value) || 30,
         max_retries: parseInt(document.getElementById('gateway_max_retries').value) || 1,
         enabled: document.getElementById('gateway_enabled').checked,
-        model_mapping: Object.keys(modelMapping).length > 0 ? modelMapping : null
+        model_mapping: Object.keys(modelMapping).length > 0 ? modelMapping : null,
+        default_target_format: null,
+        supported_formats: []
     };
+
+    if (config.provider === 'openai') {
+        config.default_target_format = document.getElementById('gateway_default_target_format')?.value || null;
+        config.supported_formats = getSelectedValues('gateway_supported_formats');
+    }
 
     try {
         submitBtn.disabled = true;
@@ -1728,6 +1915,14 @@ async function deleteGatewayConfig() {
             // 重置表单
             document.getElementById('gatewayForm').reset();
             document.getElementById('gateway-model-mapping-rows').innerHTML = '';
+            document.getElementById('gateway_default_target_format').value = '';
+            setSelectedValues('gateway_supported_formats', []);
+            syncOpenAITargetFormatVisibility(
+                'gateway_provider',
+                'gateway-target-format-section',
+                'gateway_default_target_format',
+                'gateway_supported_formats'
+            );
             await loadGatewayConfig();
         } else {
             showToast('删除失败: ' + (data.message || '未知错误'), 'error');
@@ -1815,12 +2010,3 @@ window.addGatewayMappingRow = addGatewayMappingRow;
 window.deleteGatewayConfig = deleteGatewayConfig;
 window.exportGatewayModelMapping = exportGatewayModelMapping;
 window.triggerGatewayImportModelMapping = triggerGatewayImportModelMapping;
-
-// 脚本加载完成后立即初始化 Gateway 配置
-// 注意：由于脚本是动态加载的，DOMContentLoaded 已经触发过了
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', initGatewayConfig);
-} else {
-    // DOM 已加载完成，直接初始化
-    setTimeout(initGatewayConfig, 50);
-}

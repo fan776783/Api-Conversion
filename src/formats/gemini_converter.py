@@ -166,7 +166,7 @@ class GeminiConverter(BaseConverter):
                     cleaned_data.pop("stream")
                     self.logger.debug("Removed internal stream flag for Gemini API")
                 return ConversionResult(success=True, data=cleaned_data)
-            elif target_format == "openai":
+            elif target_format in {"openai", "openai_chat_completions"}:
                 return self._convert_to_openai_request(data)
             elif target_format == "anthropic":
                 return self._convert_to_anthropic_request(data)

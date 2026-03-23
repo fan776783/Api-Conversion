@@ -50,6 +50,8 @@ def _build_gateway_client(monkeypatch, captured):
             timeout=30,
             max_retries=1,
             model_mapping={},
+            default_target_format=OPENAI_CHAT_COMPLETIONS_FORMAT,
+            supported_formats=[OPENAI_CHAT_COMPLETIONS_FORMAT, OPENAI_RESPONSES_FORMAT],
             enabled=True,
         ),
     )
@@ -59,6 +61,7 @@ def _build_gateway_client(monkeypatch, captured):
         channel,
         request_data,
         source_format,
+        target_format,
         request_started_at=None,
         upstream_response_started_at=None,
         request_id=None,
@@ -73,6 +76,7 @@ def _build_gateway_client(monkeypatch, captured):
             {
                 "kind": "stream",
                 "source_format": source_format,
+                "target_format": target_format,
                 "request_data": request_data,
                 "channel_provider": channel.provider,
             }
@@ -254,6 +258,7 @@ def test_gateway_responses_streaming_returns_response_events(monkeypatch):
     assert upstream["url"].endswith("/v1/responses")
     stream_call = next(item for item in captured if item["kind"] == "stream")
     assert stream_call["source_format"] == OPENAI_RESPONSES_FORMAT
+    assert stream_call["target_format"] == OPENAI_RESPONSES_FORMAT
     assert stream_call["request_data"]["stream"] is True
 
 
@@ -284,4 +289,5 @@ def test_gateway_chat_streaming_returns_chat_done_marker(monkeypatch):
     assert upstream["url"].endswith("/v1/chat/completions")
     stream_call = next(item for item in captured if item["kind"] == "stream")
     assert stream_call["source_format"] == OPENAI_CHAT_COMPLETIONS_FORMAT
+    assert stream_call["target_format"] == OPENAI_CHAT_COMPLETIONS_FORMAT
     assert stream_call["request_data"]["stream"] is True

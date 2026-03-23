@@ -20,6 +20,7 @@ from src.utils.auth import auth_manager
 from src.utils.security import mask_api_key
 from api.conversion_api import router as conversion_router
 from api.unified_api import router as unified_router
+from src.core.protocol_resolution import get_openai_protocol_options
 
 app = FastAPI(title="AI API统一转换代理系统", version="1.0.0")
 logger = setup_logger("web_api")
@@ -379,6 +380,24 @@ async def dashboard(request: Request):
                                 <input type="number" id="max_retries" name="max_retries" value="3" min="1" max="10">
                             </div>
                         </div>
+                        <div class="form-section" id="target-format-section">
+                            <h4>OpenAI 目标协议配置</h4>
+                            <p class="form-hint">仅在目标提供商为 OpenAI 时生效。用于声明上游渠道默认使用哪种 OpenAI 协议，以及该渠道实际支持哪些 OpenAI 子协议。</p>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="default_target_format">默认目标协议:</label>
+                                    <select id="default_target_format" name="default_target_format">
+                                        <option value="">跟随客户端请求 / 自动解析</option>
+                                    </select>
+                                    <small class="form-hint">用于声明该 OpenAI 渠道在客户端意图不明确时默认走哪个上游协议，不会覆盖显式请求路径。</small>
+                                </div>
+                                <div class="form-group">
+                                    <label for="supported_formats">支持的目标协议:</label>
+                                    <select id="supported_formats" name="supported_formats" multiple size="3"></select>
+                                    <small class="form-hint">按住 Command / Ctrl 可多选。用于声明该 OpenAI 渠道支持的上游协议集合。</small>
+                                </div>
+                            </div>
+                        </div>
                         <div class="form-section" id="model-mapping-section">
                             <h4>模型映射</h4>
                             <p class="form-hint">当客户端请求某个模型时，可映射为渠道实际调用的模型。例如：将 <code>A1</code> 映射为 <code>B1</code>。可配置多条。</p>
@@ -440,6 +459,23 @@ async def dashboard(request: Request):
                                 <input type="number" id="gateway_max_retries" name="max_retries" value="1" min="0" max="10">
                             </div>
                         </div>
+                        <div class="form-section" id="gateway-target-format-section">
+                            <h4>OpenAI 目标协议配置</h4>
+                            <p class="form-hint">仅当 Gateway 目标提供商为 OpenAI 时生效，用于声明全局转发默认走哪个 OpenAI 协议，以及该上游实际支持哪些 OpenAI 子协议。</p>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="gateway_default_target_format">默认目标协议:</label>
+                                    <select id="gateway_default_target_format" name="default_target_format">
+                                        <option value="">跟随客户端请求 / 自动解析</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label for="gateway_supported_formats">支持的目标协议:</label>
+                                    <select id="gateway_supported_formats" name="supported_formats" multiple size="3"></select>
+                                    <small class="form-hint">按住 Command / Ctrl 可多选。声明 Gateway 目标上游支持的 OpenAI 子协议集合。</small>
+                                </div>
+                            </div>
+                        </div>
                         <div class="form-row">
                             <div class="form-group" style="grid-column: 1 / -1;">
                                 <label class="checkbox-label">
@@ -475,6 +511,7 @@ async def dashboard(request: Request):
                 <div class="usage-description">
                     <p><strong>核心功能：</strong>AI API格式统一转换代理系统，支持OpenAI、Anthropic、Gemini三种格式的相互转换</p>
                     <p><strong>智能路由：</strong>根据请求路径自动识别API格式，根据自定义key识别目标渠道，自动进行格式转换</p>
+                    <p><strong>OpenAI 协议声明：</strong>当目标提供商为 OpenAI 时，可通过 <code>default_target_format</code> 与 <code>supported_formats</code> 声明上游实际支持的 Chat Completions / Responses 子协议，用于提升路由与兼容性，但不会覆盖客户端显式请求路径。</p>
                 </div>
                 <div class="usage-notes">
                     <h4>工作原理</h4>

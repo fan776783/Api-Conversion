@@ -81,6 +81,7 @@ OpenAI ↔ Anthropic ↔ Gemini
 - ✅ **视觉理解**：图像输入格式统一处理
 - ✅ **结构化输出**：JSON Schema 自动适配
 - ✅ **模型映射**：智能模型名称转换
+- ✅ **OpenAI 协议声明**：支持为 OpenAI 渠道和 Gateway 显式配置 `default_target_format` 与 `supported_formats`，声明上游默认协议与支持的 Chat Completions / Responses 子协议
 - ✅ **思考预算转换**：支持 OpenAI reasoning_effort ↔ Anthropic/Gemini thinkingBudget 互转
 - ✅ **代理支持**：支持 HTTP/HTTPS/SOCKS5 代理，内置连通性测试
 

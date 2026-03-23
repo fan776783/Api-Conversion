@@ -26,6 +26,8 @@ class ChannelInfo:
     max_retries: int = 3
     enabled: bool = True
     models_mapping: Optional[Dict[str, str]] = None
+    default_target_format: Optional[str] = None
+    supported_formats: Optional[List[str]] = None
     # Payload 配置：支持请求参数的默认值设置和强制覆盖
     # 格式: {"default": {"key": value}, "override": {"key": value}}
     payload_config: Optional[Dict[str, Any]] = None
@@ -66,6 +68,8 @@ class ChannelManager:
         timeout: int = 30,
         max_retries: int = 3,
         models_mapping: Optional[Dict[str, str]] = None,
+        default_target_format: Optional[str] = None,
+        supported_formats: Optional[List[str]] = None,
         payload_config: Optional[Dict[str, Any]] = None,
         use_proxy: bool = False,
         proxy_type: Optional[str] = None,
@@ -87,6 +91,8 @@ class ChannelManager:
             timeout=timeout,
             max_retries=max_retries,
             models_mapping=models_mapping,
+            default_target_format=default_target_format,
+            supported_formats=supported_formats,
             payload_config=payload_config,
             use_proxy=use_proxy,
             proxy_type=proxy_type,
@@ -107,6 +113,8 @@ class ChannelManager:
         max_retries: Optional[int] = None,
         enabled: Optional[bool] = None,
         models_mapping: Optional[Dict[str, str]] = None,
+        default_target_format: Optional[str] = None,
+        supported_formats: Optional[List[str]] = None,
         payload_config: Optional[Dict[str, Any]] = None,
         use_proxy: Optional[bool] = None,
         proxy_type: Optional[str] = None,
@@ -126,6 +134,8 @@ class ChannelManager:
             max_retries=max_retries,
             enabled=enabled,
             models_mapping=models_mapping,
+            default_target_format=default_target_format,
+            supported_formats=supported_formats,
             payload_config=payload_config,
             use_proxy=use_proxy,
             proxy_type=proxy_type,

@@ -5,7 +5,7 @@ Gateway 转发配置
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 from src.utils.database import db_manager
 from src.utils.logger import setup_logger
@@ -24,6 +24,8 @@ class GatewayConfig:
     timeout: int = 30
     max_retries: int = 1
     model_mapping: Dict[str, str] = field(default_factory=dict)
+    default_target_format: Optional[str] = None
+    supported_formats: List[str] = field(default_factory=list)
     enabled: bool = True
 
     def __post_init__(self):
@@ -37,6 +39,8 @@ class GatewayConfig:
             raise ValueError("Gateway max_retries must be >= 0")
         if self.model_mapping is None:
             self.model_mapping = {}
+        if self.supported_formats is None:
+            self.supported_formats = []
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -45,6 +49,8 @@ class GatewayConfig:
             "timeout": self.timeout,
             "max_retries": self.max_retries,
             "model_mapping": self.model_mapping or {},
+            "default_target_format": self.default_target_format,
+            "supported_formats": self.supported_formats or [],
             "enabled": self.enabled,
         }
 
@@ -58,6 +64,8 @@ class GatewayConfig:
             timeout=int(data.get("timeout", 30)),
             max_retries=int(data.get("max_retries", 1)),
             model_mapping=data.get("model_mapping") or {},
+            default_target_format=data.get("default_target_format"),
+            supported_formats=data.get("supported_formats") or [],
             enabled=bool(data.get("enabled", True)),
         )
 

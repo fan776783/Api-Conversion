@@ -10,10 +10,13 @@ for path in (PROJECT_ROOT, SRC_ROOT):
         sys.path.insert(0, path_str)
 
 from src.api.conversion_api import detect_request_format
+from src.formats.anthropic_converter import AnthropicConverter
+from src.formats.gemini_converter import GeminiConverter
 from src.formats.converter_factory import (
     OPENAI_CHAT_COMPLETIONS_FORMAT,
     OPENAI_RESPONSES_FORMAT,
     canonical_format_name,
+    convert_request,
     convert_response,
     convert_streaming_chunk,
 )
@@ -289,6 +292,41 @@ def test_non_streaming_responses_conversion_builds_response_object():
     assert result.data["output_text"] == "hello"
     function_call = next(item for item in result.data["output"] if item["type"] == "function_call")
     assert json.loads(function_call["arguments"]) == {"old_string": "before"}
+
+
+
+def test_anthropic_converter_accepts_openai_chat_completions_target_alias():
+    converter = AnthropicConverter()
+    payload = {
+        "model": "claude-3-5-sonnet",
+        "max_tokens": 128,
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+
+    result = converter.convert_request(payload, OPENAI_CHAT_COMPLETIONS_FORMAT)
+
+    assert result.success is True
+    assert result.data["model"] == "claude-3-5-sonnet"
+    assert result.data["messages"][0] == {"role": "user", "content": "hello"}
+
+
+
+def test_gemini_converter_accepts_openai_chat_completions_target_alias():
+    payload = {
+        "model": "gemini-2.5-pro",
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": "hello"}],
+            }
+        ],
+    }
+
+    result = convert_request("gemini", OPENAI_CHAT_COMPLETIONS_FORMAT, payload)
+
+    assert result.success is True
+    assert result.data["model"] == "gemini-2.5-pro"
+    assert result.data["messages"][0] == {"role": "user", "content": "hello"}
 
 
 

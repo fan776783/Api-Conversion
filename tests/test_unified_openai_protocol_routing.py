@@ -60,6 +60,7 @@ def _build_test_client(monkeypatch, captured):
         channel,
         request_data,
         source_format,
+        target_format,
         headers=None,
         request_started_at=None,
         request_id=None,
@@ -71,6 +72,7 @@ def _build_test_client(monkeypatch, captured):
                 "channel": asdict(channel),
                 "request_data": request_data,
                 "source_format": source_format,
+                "target_format": target_format,
                 "request_method": request_method,
                 "request_path": request_path,
             }
@@ -137,6 +139,7 @@ def test_chat_endpoint_normalizes_misdirected_responses_payload(monkeypatch):
     assert len(captured) == 1
     forwarded = captured[0]
     assert forwarded["source_format"] == OPENAI_CHAT_COMPLETIONS_FORMAT
+    assert forwarded["target_format"] == OPENAI_CHAT_COMPLETIONS_FORMAT
     assert forwarded["request_path"] == "/v1/chat/completions"
     assert forwarded["request_data"]["stream"] is False
     assert forwarded["request_data"]["max_tokens"] == 128
@@ -169,6 +172,7 @@ def test_responses_endpoint_keeps_responses_protocol_for_non_streaming(monkeypat
     assert len(captured) == 1
     forwarded = captured[0]
     assert forwarded["source_format"] == OPENAI_RESPONSES_FORMAT
+    assert forwarded["target_format"] == OPENAI_RESPONSES_FORMAT
     assert forwarded["request_path"] == "/v1/responses"
     assert forwarded["request_data"]["input"] == "hello"
 
@@ -201,6 +205,7 @@ def test_responses_endpoint_streaming_returns_response_events(monkeypatch):
     assert len(captured) == 1
     forwarded = captured[0]
     assert forwarded["source_format"] == OPENAI_RESPONSES_FORMAT
+    assert forwarded["target_format"] == OPENAI_RESPONSES_FORMAT
     assert forwarded["request_data"]["stream"] is True
 
 
@@ -230,4 +235,5 @@ def test_chat_endpoint_streaming_returns_chat_done_marker(monkeypatch):
     assert len(captured) == 1
     forwarded = captured[0]
     assert forwarded["source_format"] == OPENAI_CHAT_COMPLETIONS_FORMAT
+    assert forwarded["target_format"] == OPENAI_CHAT_COMPLETIONS_FORMAT
     assert forwarded["request_data"]["stream"] is True
