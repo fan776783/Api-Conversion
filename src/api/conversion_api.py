@@ -14,7 +14,14 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from channels.channel_manager import channel_manager, ChannelInfo
-from formats.converter_factory import ConverterFactory, convert_request, convert_response
+from formats.converter_factory import (
+    ConverterFactory,
+    convert_request,
+    convert_response,
+    canonical_format_name,
+    OPENAI_CHAT_COMPLETIONS_FORMAT,
+    OPENAI_RESPONSES_FORMAT,
+)
 from src.utils.logger import (
     setup_logger,
     log_observe_request_done,
@@ -97,26 +104,36 @@ class ChannelUpdateRequest(BaseModel):
 
 async def detect_request_format(request_data: Dict[str, Any], path: str) -> str:
     """检测请求格式"""
+    # 基于请求数据结构优先识别 Responses 风格，支持误投到 /chat/completions 的场景
+    if isinstance(request_data, dict):
+        has_responses_shape = (
+            "messages" not in request_data
+            and any(key in request_data for key in ("input", "instructions", "max_output_tokens", "previous_response_id"))
+        )
+        if has_responses_shape:
+            return "openai_responses"
+
     # 基于URL路径检测
     if "/openai/" in path or path.endswith("/chat/completions"):
-        return "openai"
+        return "openai_chat_completions"
+    elif path.endswith("/responses") or "/v1/responses" in path:
+        return "openai_responses"
     elif "/anthropic/" in path or path.endswith("/messages") or "/v1/messages" in path:
         # Anthropic: /anthropic/ 前缀，或以 /messages 结尾，或包含 /v1/messages（如 /v1/messages/count_tokens）
         return "anthropic"
     elif "/gemini/" in path or "generateContent" in path:
         return "gemini"
-    
-    # 基于请求数据结构检测
+
     if "messages" in request_data and "model" in request_data:
         if "system" in request_data:
             return "anthropic"
         else:
-            return "openai"
+            return "openai_chat_completions"
     elif "contents" in request_data:
         return "gemini"
-    
-    # 默认返回openai格式
-    return "openai"
+
+    # 默认返回openai chat格式
+    return "openai_chat_completions"
 
 
 
@@ -149,7 +166,10 @@ async def forward_request(
         log_diagnose_event(logger, "Failed to apply model mapping", extra={"error": str(e)}, level=logging.WARNING)
     # 构建请求URL
     if channel.provider == "openai":
-        url = f"{channel.base_url.rstrip('/')}/chat/completions"
+        if target_format == "openai_responses":
+            url = f"{channel.base_url.rstrip('/')}/responses"
+        else:
+            url = f"{channel.base_url.rstrip('/')}/chat/completions"
         headers["Authorization"] = f"Bearer {channel.api_key}"
     elif channel.provider == "anthropic":
         url = f"{channel.base_url.rstrip('/')}/v1/messages"
@@ -433,8 +453,14 @@ async def test_channel(channel_id: str, _: bool = Depends(get_session_user)):
 # 格式转换API
 @router.post("/openai/v1/chat/completions")
 async def openai_chat_completions(request: Request):
-    """OpenAI格式API端点"""
-    return await handle_conversion_request(request, "openai")
+    """OpenAI Chat Completions 格式API端点"""
+    return await handle_conversion_request(request, "openai_chat_completions")
+
+
+@router.post("/openai/v1/responses")
+async def openai_responses(request: Request):
+    """OpenAI Responses 格式API端点"""
+    return await handle_conversion_request(request, "openai_responses")
 
 
 @router.post("/anthropic/v1/messages")
@@ -473,8 +499,8 @@ async def handle_conversion_request(request: Request, target_format: str):
             },
         )
         
-        # 如果源格式和目标格式相同，直接转发
-        if source_format == target_format:
+        # 如果源格式和目标格式同属同一协议族，直接转发
+        if canonical_format_name(source_format) == canonical_format_name(target_format):
             # 根据目标格式找到合适的渠道
             channels = channel_manager.get_channels_by_provider(target_format)
             if not channels:

@@ -20,7 +20,11 @@ from formats.converter_factory import (
     convert_response,
     convert_streaming_chunk,
     clear_stream_converters,
+    canonical_format_name,
+    OPENAI_CHAT_COMPLETIONS_FORMAT,
+    OPENAI_RESPONSES_FORMAT,
 )
+from formats.openai_responses_request_adapter import OpenAIResponsesRequestAdapter
 from formats.base_converter import ConversionResult
 from utils.security import mask_api_key, safe_log_request, safe_log_response
 from src.utils.logger import (
@@ -49,6 +53,16 @@ STREAM_TRACE_LOG = env_config.get_bool("STREAM_TRACE_LOG", False)
 STREAM_CHUNK_LOG_EVERY_N = env_config.get_int("STREAM_CHUNK_LOG_EVERY_N", 50)
 
 router = APIRouter()
+
+
+def resolve_openai_subprotocol(request_path: Optional[str], request_data: Dict[str, Any]) -> str:
+    """根据路径和请求体识别 OpenAI 子协议。"""
+    path = request_path or ""
+    if path.endswith("/v1/responses") or "/responses" in path:
+        return OPENAI_RESPONSES_FORMAT
+    if isinstance(request_data, dict) and OpenAIResponsesRequestAdapter.looks_like_responses_request(request_data):
+        return OPENAI_RESPONSES_FORMAT
+    return OPENAI_CHAT_COMPLETIONS_FORMAT
 
 
 def _extract_max_tokens(source_format: str, request_data: Dict[str, Any]) -> Optional[int]:
@@ -300,6 +314,13 @@ def _parse_upstream_error(provider: str, status_code: int, body: str) -> str:
     return f"{prefix}: {body}" if body else prefix
 
 
+def _provider_matches_format(provider: str, format_name: str) -> bool:
+    canonical = canonical_format_name(format_name)
+    if provider == "openai":
+        return canonical in {OPENAI_CHAT_COMPLETIONS_FORMAT, OPENAI_RESPONSES_FORMAT}
+    return provider == canonical
+
+
 async def fetch_models_from_channel_for_format(channel: ChannelInfo, target_format: str) -> List[Dict[str, Any]]:
     """从目标渠道获取模型列表并转换为指定格式"""
     try:
@@ -313,9 +334,10 @@ async def fetch_models_from_channel_for_format(channel: ChannelInfo, target_form
         raw_models = await fetch_raw_models_from_channel(channel)
         
         # 根据目标格式转换
-        if target_format == "openai":
+        canonical_target = canonical_format_name(target_format)
+        if canonical_target in {OPENAI_CHAT_COMPLETIONS_FORMAT, OPENAI_RESPONSES_FORMAT}:
             return convert_models_to_openai_format(raw_models, channel.provider)
-        elif target_format == "anthropic":
+        elif canonical_target == "anthropic":
             return convert_models_to_anthropic_format(raw_models, channel.provider)
         elif target_format == "gemini":
             return convert_models_to_gemini_format(raw_models, channel.provider)
@@ -672,7 +694,7 @@ async def forward_request_to_channel(
         request_data = apply_payload_config(request_data, channel.payload_config)
     
     # 1. 检查是否为同格式透传 - 但对于Anthropic需要特殊处理图片排序
-    if source_format == channel.provider:
+    if _provider_matches_format(channel.provider, source_format):
         # 对于Anthropic格式，即使是透传也需要应用图片优先的最佳实践
         if channel.provider == "anthropic":
             # 检查是否包含图片内容
@@ -786,7 +808,8 @@ async def forward_request_to_channel(
     is_streaming = request_data.get("stream", False)
     
     if channel.provider == "openai":
-        url = f"{channel.base_url.rstrip('/')}/chat/completions"
+        upstream_path = "/responses" if source_format == OPENAI_RESPONSES_FORMAT else "/chat/completions"
+        url = f"{channel.base_url.rstrip('/')}{upstream_path}"
         target_headers["Authorization"] = f"Bearer {channel.api_key}"
     elif channel.provider == "anthropic":
         url = f"{channel.base_url.rstrip('/')}/v1/messages"
@@ -1048,8 +1071,10 @@ async def handle_streaming_response(
         output_chars = 0
         
         # 根据客户端期望的格式选择合适的结束标记
-        if source_format == "openai":
+        if source_format == OPENAI_CHAT_COMPLETIONS_FORMAT:
             end_marker = "data: [DONE]\n\n"
+        elif source_format == OPENAI_RESPONSES_FORMAT:
+            end_marker = ""
         elif source_format == "gemini":
             # Gemini不需要特殊的结束标记，最后一个chunk包含finishReason即可
             end_marker = ""
@@ -1060,7 +1085,7 @@ async def handle_streaming_response(
             end_marker = "data: [DONE]\n\n"
 
         # For same-format passthrough, we need to preserve the complete SSE structure
-        if channel.provider == source_format:
+        if _provider_matches_format(channel.provider, source_format):
             log_diagnose_event(
                 logger,
                 "Passthrough mode activated",
@@ -1260,11 +1285,16 @@ async def handle_streaming_response(
                             if extracted_usage:
                                 final_usage = extracted_usage
 
-                        # 对于 Anthropic SSE：如果转换器已经输出 message_stop，就不要再额外补一个 end_marker。
+                        # 对于 Anthropic SSE：如果转换器已经输出 message_stop / response.completed，就不要再额外补结束标记。
                         if source_format == "anthropic":
                             if isinstance(converted_data, str) and "event: message_stop" in converted_data:
                                 sent_end_marker = True
                             elif isinstance(converted_data, list) and any("event: message_stop" in ev for ev in converted_data):
+                                sent_end_marker = True
+                        elif source_format == OPENAI_RESPONSES_FORMAT:
+                            if isinstance(converted_data, str) and "event: response.completed" in converted_data:
+                                sent_end_marker = True
+                            elif isinstance(converted_data, list) and any("event: response.completed" in ev for ev in converted_data):
                                 sent_end_marker = True
                         
                         if isinstance(converted_data, str):
@@ -1604,7 +1634,7 @@ def handle_non_streaming_response(
         logger.debug(f"Received response from {channel.provider}: {safe_log_response(response_data)}")
         
         # 检查是否为同格式透传
-        if channel.provider == source_format:
+        if _provider_matches_format(channel.provider, source_format):
             logger.debug(f"Same format passthrough for non-streaming response: {channel.provider} -> {source_format}")
             # 同格式直接返回原始数据
             return response_data
@@ -1751,9 +1781,16 @@ async def unified_openai_format_endpoint(
     api_key: str = Depends(extract_openai_api_key)
 ):
     """OpenAI格式统一端点（使用标准OpenAI认证）"""
-    return await handle_unified_request(request, api_key, source_format="openai")
+    return await handle_unified_request(request, api_key, source_format=OPENAI_CHAT_COMPLETIONS_FORMAT)
 
 
+@router.post("/v1/responses")
+async def unified_openai_responses_endpoint(
+    request: Request,
+    api_key: str = Depends(extract_openai_api_key)
+):
+    """OpenAI Responses 统一端点（使用标准 OpenAI 认证）"""
+    return await handle_unified_request(request, api_key, source_format=OPENAI_RESPONSES_FORMAT)
 
 
 # 统一的模型列表端点：根据认证方式自动识别格式
@@ -1792,7 +1829,7 @@ async def list_models_unified(
         logger.debug(f"Returning {len(models)} {target_format} format models")
         
         # 根据格式返回不同的响应结构
-        if target_format == "openai":
+        if canonical_format_name(target_format) in {OPENAI_CHAT_COMPLETIONS_FORMAT, OPENAI_RESPONSES_FORMAT}:
             return {
                 "object": "list",
                 "data": models
@@ -2005,6 +2042,11 @@ async def handle_unified_request(request, api_key: str, source_format: str):
 
         # 2. 获取请求数据
         request_data = await request.json()
+        request_path = request.url.path if hasattr(request, "url") else None
+        if source_format in {"openai", OPENAI_CHAT_COMPLETIONS_FORMAT, OPENAI_RESPONSES_FORMAT}:
+            source_format = resolve_openai_subprotocol(request_path, request_data)
+            if source_format == OPENAI_CHAT_COMPLETIONS_FORMAT and OpenAIResponsesRequestAdapter.looks_like_responses_request(request_data):
+                request_data = OpenAIResponsesRequestAdapter.adapt(request_data)
 
         # 3. 验证必须字段
         if not request_data.get("model"):
@@ -2030,7 +2072,6 @@ async def handle_unified_request(request, api_key: str, source_format: str):
         request_started_at = time.perf_counter()
         request_headers = dict(request.headers)
         request_url = str(request.url)
-        request_path = request.url.path if hasattr(request, "url") else None
         request_id = log_request_entry(
             logger,
             request_method=request.method,
@@ -2722,6 +2763,8 @@ async def gateway_proxy(full_path: str, request: Request):
     detect_path = "/" + full_path if full_path else ""
     try:
         source_format = await detect_request_format(request_data, path=detect_path)
+        source_canonical = canonical_format_name(source_format)
+        provider_canonical = canonical_format_name(config.provider)
     except Exception as e:
         logger.warning(f"Failed to detect request format: {e}, defaulting to openai")
         source_format = "openai"
@@ -2845,7 +2888,7 @@ async def gateway_proxy(full_path: str, request: Request):
 
     # 7. 请求格式转换（仅对有 JSON 请求体的方法）
     if has_body:
-        if source_format == config.provider:
+        if source_canonical == provider_canonical:
             converted_data = request_data.copy()
             # Gemini 不接受请求体中的 stream 字段
             if config.provider == "gemini":
@@ -2932,10 +2975,10 @@ async def gateway_proxy(full_path: str, request: Request):
         else:
             path = "/" + full_path.lstrip("/") if full_path else ""
             url = f"{base}{path}"
-    elif request.method in ("POST", "PUT") and source_format != config.provider:
+    elif request.method in ("POST", "PUT") and source_canonical != provider_canonical:
         # 跨格式转换：使用目标 provider 的规范端点
         if config.provider == "openai":
-            url = f"{base}/v1/chat/completions"
+            url = f"{base}/v1/responses" if source_canonical == OPENAI_RESPONSES_FORMAT else f"{base}/v1/chat/completions"
         elif config.provider == "anthropic":
             url = f"{base}/v1/messages"
         else:
@@ -3117,7 +3160,7 @@ async def gateway_proxy(full_path: str, request: Request):
             logger.debug(f"Gateway upstream response body: {safe_log_response(response_data)}")
 
             # 响应格式转换（仅对 POST / PUT 做格式转换）
-            if has_body and source_format != config.provider:
+            if has_body and source_canonical != provider_canonical:
                 response_result = convert_response(config.provider, source_format, response_data)
                 if response_result.success:
                     response_data = response_result.data

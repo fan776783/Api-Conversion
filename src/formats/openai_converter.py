@@ -1,6 +1,6 @@
 """
-OpenAI格式转换器
-处理OpenAI API格式与其他格式之间的转换
+OpenAI Chat Completions 格式转换器
+处理 OpenAI Chat Completions 与其他格式之间的转换
 """
 from typing import Dict, Any, Optional, List
 import json
@@ -9,6 +9,7 @@ import copy
 from src.utils.logger import log_diagnose_event
 
 from .base_converter import BaseConverter, ConversionResult, ConversionError
+from .anthropic_sse_parser import AnthropicSSEParseError, parse_anthropic_sse_event
 
 
 class OpenAIConverter(BaseConverter):
@@ -24,14 +25,21 @@ class OpenAIConverter(BaseConverter):
     
     def reset_streaming_state(self):
         """重置所有流式相关的状态变量，避免状态污染"""
-        streaming_attrs = ['_anthropic_stream_id', '_openai_sent_start', '_openai_text_started']
+        streaming_attrs = [
+            '_anthropic_stream_id',
+            '_openai_sent_start',
+            '_openai_text_started',
+            '_stream_id',
+            '_anthropic_tool_state',
+            '_anthropic_finish_reason',
+        ]
         for attr in streaming_attrs:
             if hasattr(self, attr):
                 delattr(self, attr)
-    
+
     def get_supported_formats(self) -> List[str]:
         """获取支持的格式列表"""
-        return ["openai", "anthropic", "gemini"]
+        return ["openai", "openai_chat_completions", "anthropic", "gemini"]
     
     def convert_request(
         self,
@@ -41,8 +49,8 @@ class OpenAIConverter(BaseConverter):
     ) -> ConversionResult:
         """转换OpenAI请求到目标格式"""
         try:
-            if target_format == "openai":
-                # OpenAI到OpenAI，格式与渠道相同，不需要转换思考参数
+            if target_format in {"openai", "openai_chat_completions"}:
+                # OpenAI Chat Completions 到 OpenAI Chat Completions，直接透传
                 return ConversionResult(success=True, data=data)
             elif target_format == "anthropic":
                 return self._convert_to_anthropic_request(data)
@@ -786,61 +794,35 @@ class OpenAIConverter(BaseConverter):
         return ConversionResult(success=True, data=result_data)
     
     def _convert_from_anthropic_streaming_chunk(self, data: Dict[str, Any]) -> ConversionResult:
-        """转换Anthropic流式响应chunk到OpenAI格式"""
+        """转换Anthropic流式响应chunk到OpenAI Chat Completions格式"""
         import time
         import random
         import string
-        
-        # 生成一致的随机ID（在同一次对话中保持一致）
+
         if not hasattr(self, '_stream_id'):
             self._stream_id = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
-        
-        # 必须有原始模型名称
+
         if not self.original_model:
             raise ValueError("Original model name is required for streaming response conversion")
-        
-        # Anthropic的流式响应是SSE格式，我们需要解析SSE事件
-        # 如果传入的data是字符串，说明是完整的SSE事件
-        if isinstance(data, str):
-            # 解析SSE事件
-            lines = data.strip().split('\n')
-            event_type = None
-            event_data = None
-            
-            for line in lines:
-                if line.startswith('event: '):
-                    event_type = line[7:]
-                elif line.startswith('data: '):
-                    import json
-                    data_content = line[6:]
-                    # 检查是否是结束标记
-                    if data_content.strip() == "[DONE]":
-                        break
-                    try:
-                        event_data = json.loads(data_content)
-                    except json.JSONDecodeError:
-                        continue
-            
-            if not event_data:
-                # 如果没有解析到数据，返回空的chunk
-                result_data = {
-                    "id": f"chatcmpl-{self._stream_id}",
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": self.original_model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": None
-                    }]
-                }
-                return ConversionResult(success=True, data=result_data)
-        else:
-            # 如果传入的是JSON对象，直接处理
-            event_data = data
-            # 优先使用_sse_event字段（由unified_api添加），否则使用type字段
-            event_type = event_data.get("_sse_event") or event_data.get("type", "")
-        
+
+        try:
+            parsed_event = parse_anthropic_sse_event(data)
+        except AnthropicSSEParseError:
+            result_data = {
+                "id": f"chatcmpl-{self._stream_id}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": self.original_model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": None
+                }]
+            }
+            return ConversionResult(success=True, data=result_data)
+
+        event_data = parsed_event.payload
+        event_type = parsed_event.event_type
         result_data = {
             "id": f"chatcmpl-{self._stream_id}",
             "object": "chat.completion.chunk",
@@ -852,14 +834,13 @@ class OpenAIConverter(BaseConverter):
                 "finish_reason": None
             }]
         }
-        
-        # 初始化工具调用状态跟踪
+
         if not hasattr(self, '_anthropic_tool_state'):
             self._anthropic_tool_state = {}
-        
-        # 根据事件类型处理
+        if not hasattr(self, '_anthropic_finish_reason'):
+            self._anthropic_finish_reason = None
+
         if event_type == "content_block_start":
-            # 内容块开始 - 检查是否是工具调用
             content_block = event_data.get("content_block", {})
             if content_block.get("type") == "tool_use":
                 tool_index = event_data.get("index", 0)
@@ -868,8 +849,6 @@ class OpenAIConverter(BaseConverter):
                     "name": content_block.get("name", ""),
                     "arguments": ""
                 }
-                
-                # 返回工具调用开始的chunk
                 result_data["choices"][0]["delta"]["tool_calls"] = [{
                     "index": tool_index,
                     "id": content_block.get("id", ""),
@@ -878,47 +857,47 @@ class OpenAIConverter(BaseConverter):
                         "name": content_block.get("name", "")
                     }
                 }]
-        
+
         elif event_type == "content_block_delta":
-            # 内容增量
             delta = event_data.get("delta", {})
             index = event_data.get("index", 0)
-            
+
             if delta.get("type") == "text_delta":
-                # 文本内容
                 result_data["choices"][0]["delta"]["content"] = delta.get("text", "")
             elif delta.get("type") == "input_json_delta":
-                # 工具调用参数增量
                 if index in self._anthropic_tool_state:
                     partial_json = delta.get("partial_json", "")
                     self._anthropic_tool_state[index]["arguments"] += partial_json
-                    
-                    result_data["choices"][0]["delta"]["tool_calls"] = [{
-                        "index": index,
-                        "function": {
-                            "arguments": partial_json
-                        }
-                    }]
-        
+                    result_data["choices"][0]["delta"] = {}
+
         elif event_type == "content_block_stop":
-            # 内容块结束 - 对工具调用不需要特殊处理，已在delta中累积完成
-            pass
-        
+            index = event_data.get("index", 0)
+            tool_state = self._anthropic_tool_state.get(index)
+            if tool_state:
+                result_data["choices"][0]["delta"]["tool_calls"] = [{
+                    "index": index,
+                    "id": tool_state.get("id", ""),
+                    "type": "function",
+                    "function": {
+                        "name": tool_state.get("name", ""),
+                        "arguments": tool_state.get("arguments", "")
+                    }
+                }]
+
         elif event_type == "message_delta":
-            # 消息结束
             delta = event_data.get("delta", {})
             stop_reason = delta.get("stop_reason")
             if stop_reason:
-                result_data["choices"][0]["finish_reason"] = self._map_finish_reason(stop_reason, "anthropic", "openai")
-        
+                self._anthropic_finish_reason = self._map_finish_reason(stop_reason, "anthropic", "openai")
+                result_data["choices"][0]["finish_reason"] = self._anthropic_finish_reason
+
         elif event_type == "message_stop":
-            # 流结束 - 清理状态
-            result_data["choices"][0]["finish_reason"] = "stop"
+            result_data["choices"][0]["finish_reason"] = self._anthropic_finish_reason or "stop"
             if hasattr(self, '_anthropic_tool_state'):
                 delattr(self, '_anthropic_tool_state')
-        
-        # 其他事件类型（message_start）返回空delta
-        
+            if hasattr(self, '_anthropic_finish_reason'):
+                delattr(self, '_anthropic_finish_reason')
+
         return ConversionResult(success=True, data=result_data)
     
     def _convert_content_to_anthropic(self, content: Any) -> Any:

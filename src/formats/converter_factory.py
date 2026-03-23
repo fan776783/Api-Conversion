@@ -5,13 +5,23 @@
 import contextvars
 import os
 from typing import Dict, Optional
+
 from .base_converter import BaseConverter, ConversionResult
 from .openai_converter import OpenAIConverter
+from .openai_responses_converter import OpenAIResponsesConverter
 from .anthropic_converter import AnthropicConverter
 from .gemini_converter import GeminiConverter
 from src.utils.logger import setup_logger
 
 logger = setup_logger("converter_factory")
+
+OPENAI_CHAT_COMPLETIONS_FORMAT = "openai_chat_completions"
+OPENAI_RESPONSES_FORMAT = "openai_responses"
+_OPENAI_ALIASES = {
+    "openai": OPENAI_CHAT_COMPLETIONS_FORMAT,
+    OPENAI_CHAT_COMPLETIONS_FORMAT: OPENAI_CHAT_COMPLETIONS_FORMAT,
+    OPENAI_RESPONSES_FORMAT: OPENAI_RESPONSES_FORMAT,
+}
 
 # Streaming debug can explode quickly. Default behavior: log only the first few
 # chunks and then every N chunks, unless STREAM_TRACE_LOG=1 is enabled.
@@ -22,45 +32,60 @@ except ValueError:
     _STREAM_CHUNK_LOG_EVERY_N = 50
 
 
+def canonical_format_name(format_name: str) -> str:
+    """规范化格式名称，兼容 openai 别名与子协议。"""
+    return _OPENAI_ALIASES.get(format_name, format_name)
+
+
 class ConverterFactory:
     """转换器工厂"""
-    
+
     _converters: Dict[str, BaseConverter] = {}
-    
+
     @classmethod
     def get_converter(cls, format_name: str) -> Optional[BaseConverter]:
         """获取指定格式的转换器"""
-        if format_name not in cls._converters:
-            cls._converters[format_name] = cls._create_converter(format_name)
-        
-        return cls._converters[format_name]
-    
+        canonical_name = canonical_format_name(format_name)
+        if canonical_name not in cls._converters:
+            cls._converters[canonical_name] = cls._create_converter(canonical_name)
+
+        return cls._converters[canonical_name]
+
     @classmethod
     def _create_converter(cls, format_name: str) -> Optional[BaseConverter]:
         """创建转换器实例"""
         converters = {
-            "openai": OpenAIConverter,
+            OPENAI_CHAT_COMPLETIONS_FORMAT: OpenAIConverter,
+            OPENAI_RESPONSES_FORMAT: OpenAIResponsesConverter,
             "anthropic": AnthropicConverter,
-            "gemini": GeminiConverter
+            "gemini": GeminiConverter,
         }
-        
+
         converter_class = converters.get(format_name)
         if converter_class:
             logger.info(f"Created converter for format: {format_name}")
             return converter_class()
-        else:
-            logger.error(f"Unsupported format: {format_name}")
-            return None
-    
+
+        logger.error(f"Unsupported format: {format_name}")
+        return None
+
     @classmethod
     def get_supported_formats(cls) -> list[str]:
         """获取支持的格式列表"""
-        return ["openai", "anthropic", "gemini"]
-    
+        return [
+            "openai",
+            OPENAI_CHAT_COMPLETIONS_FORMAT,
+            OPENAI_RESPONSES_FORMAT,
+            "anthropic",
+            "gemini",
+        ]
+
     @classmethod
     def is_format_supported(cls, format_name: str) -> bool:
         """检查格式是否支持"""
-        return format_name in cls.get_supported_formats()
+        return canonical_format_name(format_name) in {
+            canonical_format_name(name) for name in cls.get_supported_formats()
+        }
 
 
 # Per-request streaming converters.
@@ -88,90 +113,96 @@ def clear_stream_converters() -> None:
     _STREAM_CONVERTERS_CTX.set(None)
 
 
+
 def _get_stream_converter(format_name: str) -> Optional[BaseConverter]:
+    canonical_name = canonical_format_name(format_name)
     converters = _get_stream_converters()
-    converter = converters.get(format_name)
+    converter = converters.get(canonical_name)
     if converter is not None:
         return converter
 
-    # Avoid using ConverterFactory singleton cache and avoid INFO log spam.
     converter_class = {
-        "openai": OpenAIConverter,
+        OPENAI_CHAT_COMPLETIONS_FORMAT: OpenAIConverter,
+        OPENAI_RESPONSES_FORMAT: OpenAIResponsesConverter,
         "anthropic": AnthropicConverter,
         "gemini": GeminiConverter,
-    }.get(format_name)
+    }.get(canonical_name)
     if converter_class is None:
-        logger.error(f"Unsupported format: {format_name}")
+        logger.error(f"Unsupported format: {canonical_name}")
         return None
 
     converter = converter_class()
-    converters[format_name] = converter
+    converters[canonical_name] = converter
     return converter
 
 
 # 便捷函数
 def convert_request(source_format: str, target_format: str, data: dict, headers: dict = None):
     """转换请求格式"""
-    converter = ConverterFactory.get_converter(source_format)
+    canonical_source = canonical_format_name(source_format)
+    canonical_target = canonical_format_name(target_format)
+
+    converter = ConverterFactory.get_converter(canonical_source)
     if not converter:
         raise ValueError(f"Unsupported source format: {source_format}")
-    
-    # 设置原始模型名称（如果存在）
-    if hasattr(converter, 'set_original_model') and 'model' in data:
-        converter.set_original_model(data['model'])
-    
-    return converter.convert_request(data, target_format, headers)
+
+    if hasattr(converter, "set_original_model") and isinstance(data, dict) and "model" in data:
+        converter.set_original_model(data["model"])
+
+    return converter.convert_request(data, canonical_target, headers)
+
 
 
 def convert_response(source_format: str, target_format: str, data: dict, original_model: str = None):
     """转换响应格式"""
-    converter = ConverterFactory.get_converter(target_format)
+    canonical_source = canonical_format_name(source_format)
+    canonical_target = canonical_format_name(target_format)
+
+    converter = ConverterFactory.get_converter(canonical_target)
     if not converter:
         raise ValueError(f"Unsupported target format: {target_format}")
-    
-    # 传递原始模型名称给转换器
-    if hasattr(converter, 'set_original_model') and original_model:
+
+    if hasattr(converter, "set_original_model") and original_model:
         converter.set_original_model(original_model)
-    
-    return converter.convert_response(data, source_format, target_format)
+
+    return converter.convert_response(data, canonical_source, canonical_target)
+
 
 
 def convert_streaming_chunk(source_format: str, target_format: str, data: dict, original_model: str = None):
-    """转换流式响应chunk格式"""
+    """转换流式响应 chunk 格式"""
     import logging
-    # 使用与unified_api相同的logger名称确保日志输出
+
     logger = logging.getLogger("unified_api")
-    
-    # 验证输入参数
+    canonical_source = canonical_format_name(source_format)
+    canonical_target = canonical_format_name(target_format)
+
     if not data:
-        logger.warning(f"Empty data passed to convert_streaming_chunk")
+        logger.warning("Empty data passed to convert_streaming_chunk")
         return ConversionResult(success=True, data={})
-    
-    # 如果源格式和目标格式相同，直接返回原始数据（无需转换）
-    if source_format == target_format:
-        logger.debug(f"Same format ({source_format}), returning data without conversion")
+
+    if canonical_source == canonical_target:
+        logger.debug(f"Same format ({canonical_source}), returning data without conversion")
         return ConversionResult(success=True, data=data)
-    
-    converter = _get_stream_converter(target_format)
+
+    converter = _get_stream_converter(canonical_target)
     if not converter:
         raise ValueError(f"Unsupported target format: {target_format}")
 
-    # Per-stream chunk counter (stored on the converter instance) to sample logs.
     cnt = getattr(converter, "_cf_stream_chunk_count", 0) + 1
     setattr(converter, "_cf_stream_chunk_count", cnt)
 
-    # Detect finish-ish chunks to always log them.
     is_finish = False
     if isinstance(data, dict):
-        if source_format == "openai" and "choices" in data:
+        if canonical_source in {"openai", OPENAI_CHAT_COMPLETIONS_FORMAT} and "choices" in data:
             choices = data.get("choices", [])
             if choices and choices[0].get("finish_reason"):
                 is_finish = True
-        elif source_format == "gemini" and "candidates" in data:
+        elif canonical_source == "gemini" and "candidates" in data:
             cands = data.get("candidates", [])
             if cands and cands[0].get("finishReason"):
                 is_finish = True
-        elif source_format == "anthropic" and data.get("type") in ("message_stop",):
+        elif canonical_source == "anthropic" and data.get("type") in ("message_stop",):
             is_finish = True
 
     should_log = (
@@ -183,29 +214,21 @@ def convert_streaming_chunk(source_format: str, target_format: str, data: dict, 
     if should_log:
         keys = list(data.keys()) if isinstance(data, dict) else "not dict"
         logger.debug(
-            f"CONVERTER_FACTORY: convert_streaming_chunk called: {source_format} -> {target_format} "
+            f"CONVERTER_FACTORY: convert_streaming_chunk called: {canonical_source} -> {canonical_target} "
             f"(n={cnt}, finish={is_finish}), keys={keys}"
         )
-    
-    # 传递原始模型名称给转换器
-    if hasattr(converter, 'set_original_model') and original_model:
+
+    if hasattr(converter, "set_original_model") and original_model:
         converter.set_original_model(original_model)
-    
-    # 智能状态重置：只在必要时重置，避免状态污染但不导致事件顺序问题
+
     should_reset_state = False
-    
-    # 检测流开始的标志
     is_stream_start = False
     if isinstance(data, dict):
-        # Gemini格式：第一个chunk通常包含responseId但没有finishReason
-        if source_format == "gemini" and "responseId" in data and "candidates" in data:
+        if canonical_source == "gemini" and "responseId" in data and "candidates" in data:
             candidates = data.get("candidates", [])
             if candidates and not candidates[0].get("finishReason"):
                 is_stream_start = True
-        # OpenAI格式：一些上游（例如 Bedrock/OpenAI 兼容网关）可能在每个chunk都带上 delta.role。
-        # 不能仅凭 role=assistant 判断“流开始”，否则会导致每个chunk都 reset，进而重复产出 message_start 等事件。
-        elif source_format == "openai" and "choices" in data:
-            # 1) 优先使用流内稳定的 id 来判定是否为新流。
+        elif canonical_source in {"openai", OPENAI_CHAT_COMPLETIONS_FORMAT} and "choices" in data:
             stream_id = data.get("id")
             if isinstance(stream_id, str) and stream_id:
                 last_stream_id = getattr(converter, "_cf_last_openai_stream_id", None)
@@ -213,61 +236,51 @@ def convert_streaming_chunk(source_format: str, target_format: str, data: dict, 
                     is_stream_start = True
                     setattr(converter, "_cf_last_openai_stream_id", stream_id)
             else:
-                # 2) 退化策略：仅当 delta 只包含 role（通常为第一帧）时认为是流开始。
                 choices = data.get("choices", [])
                 if choices:
                     delta = choices[0].get("delta", {}) or {}
                     if isinstance(delta, dict) and delta.get("role") == "assistant":
-                        # 避免把带 content/tool_calls 的chunk当作开始
                         delta_keys = set(delta.keys())
                         if delta_keys == {"role"}:
                             is_stream_start = True
-        # Anthropic格式：检查message_start事件
-        elif source_format == "anthropic" and data.get("type") == "message_start":
+        elif canonical_source == "anthropic" and data.get("type") == "message_start":
             is_stream_start = True
-    
-    # 检查是否需要重置状态的条件：
-    # 1. 转换器实例被复用但模型名称不同
-    # 2. 或者是明确的流开始事件
-    if hasattr(converter, 'reset_streaming_state') and hasattr(converter, 'original_model'):
-        current_model = getattr(converter, 'original_model', None)
+
+    if hasattr(converter, "reset_streaming_state") and hasattr(converter, "original_model"):
+        current_model = getattr(converter, "original_model", None)
         if current_model != original_model:
             should_reset_state = True
             logger.debug(f"Model changed from {current_model} to {original_model}, resetting state")
         elif is_stream_start:
-            # 只在明确的流开始时重置
             should_reset_state = True
-            logger.debug(f"Stream start detected, resetting state")
-    
+            logger.debug("Stream start detected, resetting state")
+
     if should_reset_state:
         logger.debug(f"Calling reset_streaming_state() on {converter.__class__.__name__}")
         converter.reset_streaming_state()
-    else:
-        pass  # 非首次chunk无需重置状态
-    
-    # 根据源格式和目标格式选择相应的流式转换方法
-    if target_format == "openai":
-        if source_format == "gemini" and hasattr(converter, '_convert_from_gemini_streaming_chunk'):
+
+    if canonical_target == OPENAI_CHAT_COMPLETIONS_FORMAT:
+        if canonical_source == "gemini" and hasattr(converter, "_convert_from_gemini_streaming_chunk"):
             return converter._convert_from_gemini_streaming_chunk(data)
-        elif source_format == "anthropic" and hasattr(converter, '_convert_from_anthropic_streaming_chunk'):
+        if canonical_source == "anthropic" and hasattr(converter, "_convert_from_anthropic_streaming_chunk"):
             return converter._convert_from_anthropic_streaming_chunk(data)
-    elif target_format == "anthropic":
-        if source_format == "openai" and hasattr(converter, '_convert_from_openai_streaming_chunk'):
-            return converter._convert_from_openai_streaming_chunk(data)
-        elif source_format == "gemini" and hasattr(converter, '_convert_from_gemini_streaming_chunk'):
-            return converter._convert_from_gemini_streaming_chunk(data)
-    elif target_format == "gemini":
-        if source_format == "openai" and hasattr(converter, '_convert_from_openai_streaming_chunk'):
-            return converter._convert_from_openai_streaming_chunk(data)
-        elif source_format == "anthropic" and hasattr(converter, '_convert_from_anthropic_streaming_chunk'):
+    elif canonical_target == OPENAI_RESPONSES_FORMAT:
+        if canonical_source == "anthropic" and hasattr(converter, "_convert_from_anthropic_streaming_chunk"):
             return converter._convert_from_anthropic_streaming_chunk(data)
-        elif source_format == "gemini" and hasattr(converter, '_convert_from_gemini_streaming_chunk'):
+    elif canonical_target == "anthropic":
+        if canonical_source in {"openai", OPENAI_CHAT_COMPLETIONS_FORMAT} and hasattr(converter, "_convert_from_openai_streaming_chunk"):
+            return converter._convert_from_openai_streaming_chunk(data)
+        if canonical_source == "gemini" and hasattr(converter, "_convert_from_gemini_streaming_chunk"):
             return converter._convert_from_gemini_streaming_chunk(data)
-    
-    # 如果没有专门的流式转换方法，检查是否是[DONE]标记或空数据
+    elif canonical_target == "gemini":
+        if canonical_source in {"openai", OPENAI_CHAT_COMPLETIONS_FORMAT} and hasattr(converter, "_convert_from_openai_streaming_chunk"):
+            return converter._convert_from_openai_streaming_chunk(data)
+        if canonical_source == "anthropic" and hasattr(converter, "_convert_from_anthropic_streaming_chunk"):
+            return converter._convert_from_anthropic_streaming_chunk(data)
+        if canonical_source == "gemini" and hasattr(converter, "_convert_from_gemini_streaming_chunk"):
+            return converter._convert_from_gemini_streaming_chunk(data)
+
     if not data or (isinstance(data, dict) and not data) or (isinstance(data, str) and data.strip() == "[DONE]"):
-        # 对于[DONE]标记或空数据，直接返回
         return ConversionResult(success=True, data=data)
-    
-    # 对于其他数据，使用常规的响应转换方法
-    return converter.convert_response(data, source_format, target_format)
+
+    return converter.convert_response(data, canonical_source, canonical_target)
