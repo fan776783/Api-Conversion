@@ -6,6 +6,7 @@ from typing import Dict, Any, Optional, List
 import json
 import copy
 
+from src.core.tool_policy import apply_openai_request_tool_policy
 from src.utils.logger import log_diagnose_event
 
 from .base_converter import BaseConverter, ConversionResult, ConversionError
@@ -49,13 +50,14 @@ class OpenAIConverter(BaseConverter):
     ) -> ConversionResult:
         """转换OpenAI请求到目标格式"""
         try:
+            normalized_data = apply_openai_request_tool_policy(data, logger=self.logger) if isinstance(data, dict) else data
             if target_format in {"openai", "openai_chat_completions"}:
                 # OpenAI Chat Completions 到 OpenAI Chat Completions，直接透传
-                return ConversionResult(success=True, data=data)
+                return ConversionResult(success=True, data=normalized_data)
             elif target_format == "anthropic":
-                return self._convert_to_anthropic_request(data)
+                return self._convert_to_anthropic_request(normalized_data)
             elif target_format == "gemini":
-                return self._convert_to_gemini_request(data)
+                return self._convert_to_gemini_request(normalized_data)
             else:
                 return ConversionResult(
                     success=False,

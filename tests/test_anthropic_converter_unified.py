@@ -72,8 +72,8 @@ class TestRequestConversion:
         assert openai_req["max_completion_tokens"] == 256
         assert "max_tokens" not in openai_req
 
-    def test_cleans_unmatched_tool_calls(self):
-        """Unmatched tool_calls should be pruned."""
+    def test_preserves_unmatched_tool_calls_with_diagnostics(self):
+        """Unmatched tool_calls should be preserved and annotated for later policy handling."""
         anthropic_request = {
             "model": "claude-3-5",
             "messages": [
@@ -104,10 +104,13 @@ class TestRequestConversion:
 
         assistant_msgs = [m for m in result.data["messages"] if m.get("role") == "assistant"]
         assert len(assistant_msgs) == 1
-        assert "tool_calls" not in assistant_msgs[0]
+        assert assistant_msgs[0]["tool_calls"][0]["id"] == "call_1"
+        diagnostics = assistant_msgs[0]["metadata"]["tool_history"]["unmatched_tool_calls"]
+        assert diagnostics["assistant_message_index"] == 1
+        assert diagnostics["original_tool_call_count"] == 1
+        assert diagnostics["unmatched_tool_call_ids"] == ["call_1"]
         assert len(warnings) == 1
-        assert "assistant_message_index=1" in warnings[0]
-        assert "original_tool_call_count=1" in warnings[0]
+        assert "preserved for policy layer" in warnings[0]
 
     def test_repairs_tool_message_missing_tool_call_id_by_name(self):
         """Tool message missing tool_call_id should be repaired by tool name when unambiguous."""
@@ -170,7 +173,7 @@ class TestRequestConversion:
         assert len(assistant_msg.get("tool_calls", [])) == 1
 
     def test_does_not_bind_ambiguous_tool_result_without_tool_use_id(self):
-        """多个候选时，缺失 tool_use_id 的 tool_result 不应误绑定，应触发清理。"""
+        """多个候选时，缺失 tool_use_id 的 tool_result 不应误绑定，应保留并标记诊断信息。"""
         anthropic_request = {
             "model": "claude-3-5",
             "messages": [
@@ -200,10 +203,214 @@ class TestRequestConversion:
         assert result.success is True
 
         assistant_msg = next(m for m in result.data["messages"] if m.get("role") == "assistant")
-        assert "tool_calls" not in assistant_msg
-        assert assistant_msg["content"] == ""
+        assert len(assistant_msg.get("tool_calls", [])) == 2
+        diagnostics = assistant_msg["metadata"]["tool_history"]["unmatched_tool_calls"]
+        assert diagnostics["original_tool_call_count"] == 2
+        assert diagnostics["unmatched_tool_call_ids"] == ["call_1", "call_2"]
         assert len(warnings) == 1
-        assert "original_tool_call_count=2" in warnings[0]
+        assert "preserved for policy layer" in warnings[0]
+    def test_preserves_top_level_extras_and_relaxed_schema(self):
+        """顶层扩展字段与 schema 扩展字段应在转换后保留。"""
+        anthropic_request = {
+            "model": "claude-3-5",
+            "x-request-id": "req-1",
+            "metadata": {"skill": "figma-ui", "discovered_tools": ["Skill"]},
+            "tools": [
+                {
+                    "name": "Skill",
+                    "description": "run a skill",
+                    "input_schema": {
+                        "type": "object",
+                        "title": "SkillArgs",
+                        "properties": {
+                            "skill": {
+                                "type": "string",
+                                "description": "skill name",
+                                "x-stability": "stable",
+                            }
+                        },
+                        "required": ["skill"],
+                        "additionalProperties": False,
+                        "x-origin": "cursor",
+                    },
+                }
+            ],
+            "messages": [
+                {
+                    "role": "assistant",
+                    "metadata": {"source": "planner"},
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call_skill_1",
+                            "name": "Skill",
+                            "input": {"skill": "figma-ui"},
+                            "metadata": {"phase": "discovery"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_skill_1",
+                            "content": "loaded",
+                            "metadata": {"phase": "loaded"},
+                        }
+                    ],
+                },
+            ],
+        }
+
+        converter = _make_converter()
+        result = converter.convert_request(anthropic_request, target_format="openai")
+        assert result.success is True
+
+        openai_req = result.data
+        assert openai_req["x-request-id"] == "req-1"
+        assert openai_req["metadata"] == {"skill": "figma-ui", "discovered_tools": ["Skill"]}
+        assert openai_req["tools"][0]["function"]["parameters"]["title"] == "SkillArgs"
+        assert openai_req["tools"][0]["function"]["parameters"]["additionalProperties"] is False
+        assert openai_req["tools"][0]["function"]["parameters"]["x-origin"] == "cursor"
+        assert openai_req["tools"][0]["function"]["parameters"]["properties"]["skill"]["x-stability"] == "stable"
+
+        assistant_msg = next(m for m in openai_req["messages"] if m.get("role") == "assistant")
+        assert assistant_msg["metadata"] == {"source": "planner"}
+        assert assistant_msg["tool_calls"][0]["metadata"] == {"phase": "discovery"}
+
+        tool_msg = next(m for m in openai_req["messages"] if m.get("role") == "tool")
+        assert tool_msg["metadata"] == {"phase": "loaded"}
+
+    def test_tool_history_round_trip_survives_follow_up_conversion(self):
+        """ToolSearch/Skill 相关扩展 metadata 应在下一轮继续保留。"""
+        openai_request = {
+            "model": "gpt-4.1",
+            "x-request-id": "req-follow-up",
+            "metadata": {"discovered_tools": ["ToolSearch", "Skill"]},
+            "messages": [
+                {
+                    "role": "assistant",
+                    "metadata": {"step": "search"},
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_search_1",
+                            "type": "function",
+                            "function": {"name": "ToolSearch", "arguments": json.dumps({"query": "select:Skill"})},
+                            "metadata": {"phase": "schema-discovery"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_search_1",
+                    "content": "schema loaded",
+                    "metadata": {"phase": "schema-loaded"},
+                },
+                {
+                    "role": "assistant",
+                    "metadata": {"step": "invoke"},
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_skill_2",
+                            "type": "function",
+                            "function": {"name": "Skill", "arguments": json.dumps({"skill": "figma-ui"})},
+                            "metadata": {"phase": "invoke"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_skill_2",
+                    "content": "started",
+                    "metadata": {"phase": "started"},
+                },
+            ],
+        }
+
+        anthropic_req = UnifiedChatRequest.from_openai(openai_request).to_anthropic()
+        round_trip = _make_converter().convert_request(anthropic_req, target_format="openai")
+        assert round_trip.success is True
+
+        openai_round_trip = round_trip.data
+        assert openai_round_trip["metadata"] == {"discovered_tools": ["ToolSearch", "Skill"]}
+        assert openai_round_trip["x-request-id"] == "req-follow-up"
+
+        assistant_msgs = [m for m in openai_round_trip["messages"] if m.get("role") == "assistant"]
+        assert assistant_msgs[0]["metadata"] == {"step": "search"}
+        assert assistant_msgs[0]["tool_calls"][0]["metadata"] == {"phase": "schema-discovery"}
+        assert assistant_msgs[1]["metadata"] == {"step": "invoke"}
+        assert assistant_msgs[1]["tool_calls"][0]["metadata"] == {"phase": "invoke"}
+
+        tool_msgs = [m for m in openai_round_trip["messages"] if m.get("role") == "tool"]
+        assert tool_msgs[0]["metadata"] == {"phase": "schema-loaded"}
+        assert tool_msgs[1]["metadata"] == {"phase": "started"}
+
+    def test_policy_rehydrates_edit_tool_from_schema_snapshot(self):
+        """参考兼容代理策略：follow-up 请求只有 discovered_tools + schema snapshot 时，也应补回可调用 tools。"""
+        anthropic_request = {
+            "model": "claude-3-5",
+            "metadata": {"discovered_tools": ["ToolSearch", "Edit"]},
+            "x-tool-schemas": {
+                "Edit": {
+                    "type": "function",
+                    "function": {
+                        "name": "Edit",
+                        "description": "edit text in file",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "old_string": {"type": "string"},
+                                "new_string": {"type": "string"},
+                                "replace_all": {"type": "boolean"},
+                            },
+                            "required": ["old_string", "new_string"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            },
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "继续修改这个文件"}]},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call_edit_2",
+                            "name": "Edit",
+                            "input": {
+                                "old_string": "before",
+                                "new_string": "after",
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_edit_2",
+                            "content": "ok",
+                        }
+                    ],
+                },
+            ],
+        }
+
+        result = _make_converter().convert_request(anthropic_request, target_format="openai")
+        assert result.success is True
+
+        openai_req = result.data
+        assert openai_req["metadata"]["discovered_tools"] == ["ToolSearch", "Edit"]
+        assert openai_req["tools"][0]["function"]["name"] == "Edit"
+        assert openai_req["tools"][0]["function"]["parameters"]["required"] == ["old_string", "new_string"]
+        assert openai_req["x-tool-schemas"]["Edit"]["function"]["parameters"]["properties"]["replace_all"]["type"] == "boolean"
+        assert openai_req["x-tool-policy"]["rehydrated_tools"] == ["Edit"]
+
     def test_regression_schema_alias_wrong_args_and_repaired_tool_response(self):
         """schema 别名回退后，错误参数名仍可透传，且缺失 tool_call_id 的工具响应可被修补。"""
         anthropic_request = {

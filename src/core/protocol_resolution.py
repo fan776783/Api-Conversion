@@ -9,6 +9,7 @@ import copy
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Sequence
 
+from src.core.tool_policy import apply_openai_request_tool_policy
 from src.formats.converter_factory import (
     OPENAI_CHAT_COMPLETIONS_FORMAT,
     OPENAI_RESPONSES_FORMAT,
@@ -176,7 +177,10 @@ def normalize_request_for_client_format(client_format: str, request_data: Dict[s
         canonical_client == OPENAI_CHAT_COMPLETIONS_FORMAT
         and OpenAIResponsesRequestAdapter.looks_like_responses_request(normalized)
     ):
-        return OpenAIResponsesRequestAdapter.adapt(normalized)
+        normalized = OpenAIResponsesRequestAdapter.adapt(normalized)
+
+    if canonical_client in OPENAI_PROTOCOLS:
+        normalized = apply_openai_request_tool_policy(normalized)
 
     return normalized
 

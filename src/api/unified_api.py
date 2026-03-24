@@ -43,6 +43,7 @@ from src.utils.http_client import get_http_client
 from src.utils.env_config import env_config
 from src.utils.model_suffix import parse_model_suffix, apply_suffix_to_request
 from src.utils.payload_config import apply_payload_config
+from src.core.tool_policy import apply_openai_request_tool_policy
 from src.core.gateway_config import load_gateway_config
 from src.core.protocol_resolution import (
     provider_supports_format,
@@ -693,6 +694,9 @@ async def forward_request_to_channel(
     # 0.5 应用渠道级 payload 配置（default/override）
     if getattr(channel, 'payload_config', None):
         request_data = apply_payload_config(request_data, channel.payload_config)
+
+    if channel.provider == "openai" and isinstance(request_data, dict):
+        request_data = apply_openai_request_tool_policy(request_data, logger=logger)
     
     # 1. 检查是否为同协议透传 - 但对于Anthropic需要特殊处理图片排序
     if _provider_matches_format(

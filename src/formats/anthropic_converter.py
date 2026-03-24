@@ -11,6 +11,7 @@ import re
 from .base_converter import BaseConverter, ConversionResult, ConversionError
 from .unified import UnifiedChatRequest, UnifiedChatResponse, UnifiedContent, UnifiedContentType
 from .unified.stream_state import StreamState, StreamPhase
+from src.core.tool_policy import apply_openai_request_tool_policy
 from src.utils.logger import log_structured_error, ERROR_TYPE_CONVERSION, log_diagnose_event
 
 # 全局工具状态管理器
@@ -210,6 +211,38 @@ class AnthropicConverter(BaseConverter):
             return "none"
         return tool_choice
 
+    def _build_unmatched_tool_call_diagnostics(
+        self,
+        assistant_index: int,
+        call_ids: List[str],
+        unmatched: List[str],
+        later_messages_checked: int,
+        unresolved_tool_messages: int,
+    ) -> Dict[str, Any]:
+        return {
+            "assistant_message_index": assistant_index,
+            "original_tool_call_count": len(call_ids),
+            "unmatched_tool_call_ids": unmatched,
+            "later_messages_checked": later_messages_checked,
+            "unresolved_tool_messages": unresolved_tool_messages,
+        }
+
+    def _attach_unmatched_tool_call_metadata(
+        self,
+        message: Dict[str, Any],
+        diagnostics: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        metadata = message.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        tool_history = metadata.get("tool_history")
+        if not isinstance(tool_history, dict):
+            tool_history = {}
+        tool_history["unmatched_tool_calls"] = diagnostics
+        metadata["tool_history"] = tool_history
+        message["metadata"] = metadata
+        return message
+
     def _repair_unmatched_tool_calls(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """参考兼容代理策略，先尝试修补 tool 响应，再决定是否清理。"""
         pending_names_by_id: Dict[str, str] = {}
@@ -363,47 +396,8 @@ class AnthropicConverter(BaseConverter):
         elif "tools" in data and result_data.get("tools") and "tool_choice" not in result_data:
             result_data["tool_choice"] = "auto"
 
-        # 6) OpenAI 兼容性校验：先尝试修补，再确保所有 assistant.tool_calls 均有匹配的 tool 响应
-        messages = self._repair_unmatched_tool_calls(result_data.get("messages", []))
-        validated_messages: List[Dict[str, Any]] = []
-        for idx, msg in enumerate(messages):
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                call_ids = [tc.get("id") for tc in msg.get("tool_calls", []) if tc.get("id")]
-                unmatched = set(call_ids)
-
-                # 在后续消息中查找对应的 tool 响应
-                for later in messages[idx + 1:]:
-                    if later.get("role") == "tool" and later.get("tool_call_id") in unmatched:
-                        unmatched.discard(later["tool_call_id"])
-                    if not unmatched:
-                        break
-
-                if unmatched:
-                    unresolved_tool_messages = [
-                        later for later in messages[idx + 1:]
-                        if later.get("role") == "tool" and not later.get("tool_call_id")
-                    ]
-                    self.logger.warning(
-                        "Unmatched tool_call IDs without tool responses, cleaning: %s; "
-                        "assistant_message_index=%s, original_tool_call_count=%s, later_messages_checked=%s, unresolved_tool_messages=%s",
-                        list(unmatched),
-                        idx,
-                        len(call_ids),
-                        len(messages) - idx - 1,
-                        len(unresolved_tool_messages),
-                    )
-                    msg["tool_calls"] = [
-                        tc for tc in msg.get("tool_calls", []) if tc.get("id") not in unmatched
-                    ]
-                    # 如果全部被移除，则降级为普通 assistant 文本消息
-                    if not msg["tool_calls"]:
-                        msg.pop("tool_calls", None)
-                        if msg.get("content") is None:
-                            msg["content"] = ""
-
-            validated_messages.append(msg)
-
-        result_data["messages"] = validated_messages
+        # 6) OpenAI tool policy：修补 tool 响应、保留 unmatched 诊断、回写 discovered tools/schema 快照
+        result_data = apply_openai_request_tool_policy(result_data, logger=self.logger)
 
         # 7) 与旧实现保持一致：如果原请求未提供 model 字段，则不在输出中强行添加
         if "model" not in data:
@@ -1538,6 +1532,41 @@ class AnthropicConverter(BaseConverter):
 
     # ==================== Schema 清理方法 ====================
 
+    _SAFE_JSON_SCHEMA_KEYS = {
+        "$defs",
+        "$ref",
+        "$schema",
+        "additionalProperties",
+        "allOf",
+        "anyOf",
+        "default",
+        "description",
+        "enum",
+        "examples",
+        "format",
+        "items",
+        "maxItems",
+        "maxLength",
+        "maximum",
+        "minItems",
+        "minLength",
+        "minimum",
+        "multipleOf",
+        "nullable",
+        "oneOf",
+        "pattern",
+        "properties",
+        "required",
+        "title",
+        "type",
+    }
+
+    _DANGEROUS_JSON_SCHEMA_KEYS = {
+        "__proto__",
+        "constructor",
+        "prototype",
+    }
+
     def _sanitize_schema(self, schema: Dict[str, Any]) -> Dict[str, Any]:
         """递归移除Gemini不支持的JSON Schema关键字"""
         if not isinstance(schema, dict):
@@ -1558,21 +1587,47 @@ class AnthropicConverter(BaseConverter):
         return sanitized
 
     def _clean_json_schema_properties(self, schema: Dict[str, Any]) -> Dict[str, Any]:
-        """递归清理Gemini不支持的JSON Schema属性"""
+        """递归清理 JSON Schema 属性，保留常见标准字段与安全扩展字段。"""
         if not isinstance(schema, dict):
             return schema
 
-        # 移除所有非标准属性
-        sanitized = {k: v for k, v in schema.items() if k in {"type", "description", "properties", "required", "enum", "items"}}
+        sanitized: Dict[str, Any] = {}
+        for key, value in schema.items():
+            if key in self._DANGEROUS_JSON_SCHEMA_KEYS:
+                continue
+            if key in self._SAFE_JSON_SCHEMA_KEYS or (isinstance(key, str) and (key.startswith("x-") or key.startswith("x_"))):
+                sanitized[key] = value
 
         if "properties" in sanitized and isinstance(sanitized["properties"], dict):
             sanitized["properties"] = {
                 prop_name: self._clean_json_schema_properties(prop_schema)
                 for prop_name, prop_schema in sanitized["properties"].items()
+                if prop_name not in self._DANGEROUS_JSON_SCHEMA_KEYS
             }
 
         if "items" in sanitized:
-            sanitized["items"] = self._clean_json_schema_properties(sanitized["items"])
+            items_value = sanitized["items"]
+            if isinstance(items_value, list):
+                sanitized["items"] = [self._clean_json_schema_properties(item) for item in items_value]
+            else:
+                sanitized["items"] = self._clean_json_schema_properties(items_value)
+
+        for composite_key in ("allOf", "anyOf", "oneOf"):
+            if composite_key in sanitized and isinstance(sanitized[composite_key], list):
+                sanitized[composite_key] = [
+                    self._clean_json_schema_properties(item)
+                    for item in sanitized[composite_key]
+                ]
+
+        if "$defs" in sanitized and isinstance(sanitized["$defs"], dict):
+            sanitized["$defs"] = {
+                def_name: self._clean_json_schema_properties(def_schema)
+                for def_name, def_schema in sanitized["$defs"].items()
+                if def_name not in self._DANGEROUS_JSON_SCHEMA_KEYS
+            }
+
+        if "additionalProperties" in sanitized and isinstance(sanitized["additionalProperties"], dict):
+            sanitized["additionalProperties"] = self._clean_json_schema_properties(sanitized["additionalProperties"])
 
         return sanitized
 

@@ -139,8 +139,62 @@ class TestUnifiedContent:
         assert unified.text == "internal reasoning"
 
 
-class TestUnifiedMessage:
-    """Tests for UnifiedMessage type conversions."""
+    def test_text_extensions_round_trip_between_formats(self):
+        """安全扩展字段应在 content/message/request 层 round-trip 保留。"""
+        anthropic_request = {
+            "model": "claude-3-5",
+            "x-request-id": "req-123",
+            "metadata": {"skill": "figma-ui"},
+            "messages": [
+                {
+                    "role": "user",
+                    "metadata": {"turn": 1},
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "hello",
+                            "metadata": {"origin": "client"},
+                            "x-trace": "trace-1",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        unified = UnifiedChatRequest.from_anthropic(anthropic_request)
+        openai_req = unified.to_openai()
+
+        assert openai_req["x-request-id"] == "req-123"
+        assert openai_req["metadata"] == {"skill": "figma-ui"}
+        assert openai_req["messages"][0]["metadata"] == {"turn": 1}
+        assert openai_req["messages"][0]["content"][0]["metadata"] == {"origin": "client"}
+        assert openai_req["messages"][0]["content"][0]["x-trace"] == "trace-1"
+
+        round_trip = UnifiedChatRequest.from_openai(openai_req).to_anthropic()
+        assert round_trip["x-request-id"] == "req-123"
+        assert round_trip["metadata"] == {"skill": "figma-ui"}
+        assert round_trip["messages"][0]["metadata"] == {"turn": 1}
+        assert round_trip["messages"][0]["content"][0]["metadata"] == {"origin": "client"}
+        assert round_trip["messages"][0]["content"][0]["x-trace"] == "trace-1"
+
+    def test_to_openai_preserves_multiple_text_blocks_structure(self):
+        """多个文本块转换到 OpenAI 时应保留分块结构。"""
+        msg = UnifiedMessage(
+            role="user",
+            content=[
+                UnifiedContent(type=UnifiedContentType.TEXT, text="hello", raw_data={"metadata": {"index": 1}}),
+                UnifiedContent(type=UnifiedContentType.TEXT, text="world", raw_data={"metadata": {"index": 2}}),
+            ],
+            raw_data={"metadata": {"turn": 1}},
+        )
+
+        openai_msg = msg.to_openai()
+
+        assert isinstance(openai_msg["content"], list)
+        assert [block["text"] for block in openai_msg["content"]] == ["hello", "world"]
+        assert openai_msg["content"][0]["metadata"] == {"index": 1}
+        assert openai_msg["content"][1]["metadata"] == {"index": 2}
+        assert openai_msg["metadata"] == {"turn": 1}
 
     def test_to_anthropic_content_ordering(self):
         """Content blocks should be ordered: thinking → signature → text → tool_use."""

@@ -47,12 +47,12 @@ class OpenAIResponsesConverter(BaseConverter):
         headers: Optional[Dict[str, str]] = None,
     ) -> ConversionResult:
         if target_format in {"openai_responses", "openai"}:
-            return ConversionResult(success=True, data=copy.deepcopy(data))
+            return ConversionResult(success=True, data=apply_openai_request_tool_policy(copy.deepcopy(data), logger=self.logger))
         if target_format in {"openai_chat_completions", "anthropic", "gemini"}:
             adapted = OpenAIResponsesRequestAdapter.adapt(data)
             if target_format == "openai_chat_completions":
-                return ConversionResult(success=True, data=adapted)
-            return ConversionResult(success=True, data=adapted)
+                return ConversionResult(success=True, data=apply_openai_request_tool_policy(adapted, logger=self.logger))
+            return ConversionResult(success=True, data=apply_openai_request_tool_policy(adapted, logger=self.logger))
         return ConversionResult(success=False, error=f"Unsupported target format: {target_format}")
 
     def convert_response(

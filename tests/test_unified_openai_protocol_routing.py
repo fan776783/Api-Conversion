@@ -147,6 +147,62 @@ def test_chat_endpoint_normalizes_misdirected_responses_payload(monkeypatch):
     assert forwarded["request_data"]["messages"][1] == {"role": "user", "content": "请修复这个 bug"}
 
 
+def test_chat_endpoint_same_protocol_passthrough_rehydrates_edit_tool(monkeypatch):
+    captured = []
+    client = _build_test_client(monkeypatch, captured)
+
+    payload = {
+        "model": "gpt-4.1",
+        "metadata": {"discovered_tools": ["Edit"]},
+        "x-tool-schemas": {
+            "Edit": {
+                "type": "function",
+                "function": {
+                    "name": "Edit",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                        },
+                        "required": ["old_string", "new_string"],
+                    },
+                },
+            }
+        },
+        "messages": [
+            {"role": "user", "content": "继续改这个文件"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_edit_3",
+                        "type": "function",
+                        "function": {
+                            "name": "Edit",
+                            "arguments": json.dumps({"old_string": "before", "new_string": "after"}),
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_edit_3", "content": "ok"},
+        ],
+    }
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer test-key"},
+        json=payload,
+    )
+
+    assert response.status_code == 200
+    forwarded = captured[0]
+    assert forwarded["request_data"]["tools"][0]["function"]["name"] == "Edit"
+    assert forwarded["request_data"]["metadata"]["discovered_tools"] == ["Edit"]
+    assert forwarded["request_data"]["x-tool-policy"]["rehydrated_tools"] == ["Edit"]
+
+
 
 def test_responses_endpoint_keeps_responses_protocol_for_non_streaming(monkeypatch):
     captured = []

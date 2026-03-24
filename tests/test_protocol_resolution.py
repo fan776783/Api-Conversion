@@ -57,6 +57,53 @@ def test_normalize_request_for_chat_adapts_responses_payload_but_keeps_stream():
     assert normalized["messages"][1] == {"role": "user", "content": "你好"}
 
 
+def test_normalize_request_for_chat_applies_tool_policy_rehydration():
+    payload = {
+        "model": "gpt-4.1",
+        "metadata": {"discovered_tools": ["Edit"]},
+        "x-tool-schemas": {
+            "Edit": {
+                "type": "function",
+                "function": {
+                    "name": "Edit",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                        },
+                        "required": ["old_string", "new_string"],
+                    },
+                },
+            }
+        },
+        "messages": [
+            {"role": "user", "content": "继续编辑"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_edit_1",
+                        "type": "function",
+                        "function": {
+                            "name": "Edit",
+                            "arguments": "{\"old_string\":\"before\",\"new_string\":\"after\"}",
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_edit_1", "content": "ok"},
+        ],
+    }
+
+    normalized = normalize_request_for_client_format(OPENAI_CHAT_COMPLETIONS_FORMAT, payload)
+
+    assert normalized["tools"][0]["function"]["name"] == "Edit"
+    assert normalized["metadata"]["discovered_tools"] == ["Edit"]
+    assert normalized["x-tool-policy"]["rehydrated_tools"] == ["Edit"]
+
+
 def test_resolve_openai_target_format_uses_supported_formats_and_default():
     target = resolve_openai_target_format(
         client_format=OPENAI_RESPONSES_FORMAT,

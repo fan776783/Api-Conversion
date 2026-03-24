@@ -37,6 +37,7 @@ from src.utils.logger import (
 )
 from src.utils.exceptions import ChannelNotFoundError, ConversionError, APIError, TimeoutError
 from src.utils.http_client import get_http_client
+from src.core.tool_policy import apply_openai_request_tool_policy
 from src.core.gateway_config import (
     GatewayConfig, load_gateway_config, save_gateway_config, delete_gateway_config
 )
@@ -489,6 +490,9 @@ async def handle_conversion_request(request: Request, target_format: str):
         normalized_request_data = protocol_context.normalized_request_data
         resolved_target_format = protocol_context.target_format
         provider_name = "openai" if canonical_format_name(resolved_target_format) in {OPENAI_CHAT_COMPLETIONS_FORMAT, OPENAI_RESPONSES_FORMAT} else resolved_target_format
+
+        if provider_name == "openai" and isinstance(normalized_request_data, dict):
+            normalized_request_data = apply_openai_request_tool_policy(normalized_request_data, logger=logger)
 
         log_diagnose_event(
             logger,

@@ -6,8 +6,81 @@ Core type definitions for the unified intermediate layer.
 
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set
 import json
+
+
+_SAFE_EXTENSION_KEY_NAMES = {
+    "metadata",
+    "extensions",
+    "extension",
+    "skill",
+    "skills",
+    "tool_metadata",
+    "tool_context",
+    "discovered_tools",
+    "discovered_tool_set",
+    "discovered-tool-set",
+}
+
+_ANTHROPIC_REQUEST_STANDARD_KEYS = {
+    "model",
+    "messages",
+    "system",
+    "max_tokens",
+    "temperature",
+    "top_p",
+    "top_k",
+    "stop_sequences",
+    "stream",
+    "tools",
+    "tool_choice",
+    "thinking",
+}
+
+_OPENAI_REQUEST_STANDARD_KEYS = {
+    "model",
+    "messages",
+    "max_tokens",
+    "temperature",
+    "top_p",
+    "stop",
+    "stream",
+    "tools",
+    "tool_choice",
+    "reasoning_effort",
+    "max_completion_tokens",
+}
+
+
+def _is_safe_extension_key(key: Any) -> bool:
+    return isinstance(key, str) and (
+        key.startswith("x-")
+        or key.startswith("x_")
+        or key in _SAFE_EXTENSION_KEY_NAMES
+    )
+
+
+def _collect_extra_fields(data: Dict[str, Any], standard_keys: Set[str]) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        return {}
+    return {key: value for key, value in data.items() if key not in standard_keys}
+
+
+def _merge_safe_extensions(
+    result: Dict[str, Any],
+    raw_data: Optional[Dict[str, Any]],
+    excluded_keys: Set[str],
+) -> Dict[str, Any]:
+    if not isinstance(raw_data, dict):
+        return result
+
+    for key, value in raw_data.items():
+        if key in excluded_keys:
+            continue
+        if _is_safe_extension_key(key):
+            result[key] = value
+    return result
 
 
 class UnifiedContentType(str, Enum):
@@ -99,7 +172,25 @@ class UnifiedContent:
         if self.cache_control:
             result["cache_control"] = self.cache_control
 
-        return result
+        return _merge_safe_extensions(
+            result,
+            self.raw_data,
+            {
+                "type",
+                "text",
+                "annotations",
+                "cache_control",
+                "thinking",
+                "signature",
+                "id",
+                "name",
+                "input",
+                "tool_use_id",
+                "content",
+                "is_error",
+                "source",
+            },
+        )
 
     def to_openai(self) -> Dict[str, Any]:
         """Convert to OpenAI message content format.
@@ -112,7 +203,8 @@ class UnifiedContent:
         - THINKING -> reasoning_content field (handled at message level)
         """
         if self.type == UnifiedContentType.TEXT:
-            return {"type": "text", "text": self.text or ""}
+            result = {"type": "text", "text": self.text or ""}
+            return _merge_safe_extensions(result, self.raw_data, {"type", "text"})
         elif self.type == UnifiedContentType.IMAGE:
             if self.image_url:
                 url = self.image_url
@@ -120,9 +212,10 @@ class UnifiedContent:
                 url = f"data:{self.image_media_type or 'image/png'};base64,{self.image_data}"
             else:
                 url = ""
-            return {"type": "image_url", "image_url": {"url": url}}
+            result = {"type": "image_url", "image_url": {"url": url}}
+            return _merge_safe_extensions(result, self.raw_data, {"type", "image_url", "url"})
         elif self.type == UnifiedContentType.TOOL_USE:
-            return {
+            result = {
                 "id": self.tool_use_id or "",
                 "type": "function",
                 "function": {
@@ -130,8 +223,10 @@ class UnifiedContent:
                     "arguments": json.dumps(self.tool_input or {}, ensure_ascii=False),
                 },
             }
+            return _merge_safe_extensions(result, self.raw_data, {"id", "type", "function", "name", "input"})
         # THINKING/SIGNATURE/TOOL_RESULT handled at message level
-        return {"type": "text", "text": self.text or ""}
+        result = {"type": "text", "text": self.text or ""}
+        return _merge_safe_extensions(result, self.raw_data, {"type", "text"})
 
     @classmethod
     def from_anthropic(cls, data: Dict[str, Any]) -> "UnifiedContent":
@@ -240,11 +335,13 @@ class UnifiedContent:
             return cls(
                 type=UnifiedContentType.THINKING,
                 text=data if isinstance(data, str) else str(data),
+                raw_data=data if is_dict else {},
             )
         else:
             return cls(
                 type=UnifiedContentType.TEXT,
                 text=str(data),
+                raw_data=data if is_dict else {},
             )
 
 
@@ -269,6 +366,9 @@ class UnifiedMessage:
     # Cache control at message level
     cache_control: Optional[Dict[str, str]] = None
 
+    # Raw/passthrough data for message-level extensions
+    raw_data: Optional[Dict[str, Any]] = field(default_factory=dict)
+
     def to_anthropic(self) -> Dict[str, Any]:
         """Convert to Anthropic message format."""
         # Handle tool result messages -> user message with tool_result content
@@ -287,7 +387,12 @@ class UnifiedMessage:
                         "content": self.content[0].text if self.content else "",
                     }
                 ]
-            return {"role": "user", "content": tool_result_blocks}
+            result = {"role": "user", "content": tool_result_blocks}
+            return _merge_safe_extensions(
+                result,
+                self.raw_data,
+                {"role", "content", "tool_call_id", "name", "cache_control"},
+            )
 
         result: Dict[str, Any] = {"role": self.role}
 
@@ -315,7 +420,14 @@ class UnifiedMessage:
         ordered_content = thinking_blocks + signature_blocks + text_blocks + tool_blocks + other_blocks
         result["content"] = ordered_content if ordered_content else [{"type": "text", "text": ""}]
 
-        return result
+        if self.cache_control:
+            result["cache_control"] = self.cache_control
+
+        return _merge_safe_extensions(
+            result,
+            self.raw_data,
+            {"role", "content", "tool_call_id", "name", "cache_control"},
+        )
 
     def to_openai(self) -> Dict[str, Any]:
         """Convert to OpenAI message format."""
@@ -323,32 +435,51 @@ class UnifiedMessage:
 
         # Handle tool response
         if self.role == "tool":
-            result["tool_call_id"] = self.tool_call_id or self.name or ""
+            result["tool_call_id"] = self.tool_call_id or ""
             result["content"] = self.content[0].tool_result_content if self.content else ""
+            if self.name:
+                result["name"] = self.name
+            result = _merge_safe_extensions(
+                result,
+                self.raw_data,
+                {"role", "content", "tool_call_id", "name", "cache_control"},
+            )
+            if self.content:
+                result = _merge_safe_extensions(
+                    result,
+                    self.content[0].raw_data,
+                    {"type", "tool_use_id", "content", "is_error", "cache_control"},
+                )
             return result
 
         # Collect different content types
         text_parts = []
+        text_blocks = []
         tool_calls = []
         reasoning_content = None
 
         for c in self.content:
             if c.type == UnifiedContentType.TEXT:
                 text_parts.append(c.text or "")
+                text_blocks.append(c.to_openai())
             elif c.type == UnifiedContentType.THINKING:
                 reasoning_content = c.text
             elif c.type == UnifiedContentType.TOOL_USE:
                 tool_calls.append(c.to_openai())
             elif c.type == UnifiedContentType.IMAGE:
-                # Keep multimodal content
-                pass
+                text_blocks.append(c.to_openai())
 
         # Build content
         if len(self.content) == 1 and self.content[0].type == UnifiedContentType.TEXT:
-            result["content"] = self.content[0].text or ""
+            if any(_is_safe_extension_key(key) for key in (self.content[0].raw_data or {}).keys()):
+                result["content"] = text_blocks
+            else:
+                result["content"] = self.content[0].text or ""
         elif any(c.type == UnifiedContentType.IMAGE for c in self.content):
             # Multimodal
-            result["content"] = [c.to_openai() for c in self.content if c.type in (UnifiedContentType.TEXT, UnifiedContentType.IMAGE)]
+            result["content"] = text_blocks
+        elif len(text_blocks) > 1:
+            result["content"] = text_blocks
         else:
             result["content"] = " ".join(text_parts) if text_parts else None
 
@@ -362,7 +493,14 @@ class UnifiedMessage:
         if reasoning_content:
             result["reasoning_content"] = reasoning_content
 
-        return result
+        if self.name:
+            result["name"] = self.name
+
+        return _merge_safe_extensions(
+            result,
+            self.raw_data,
+            {"role", "content", "tool_call_id", "tool_calls", "reasoning_content", "name", "cache_control"},
+        )
 
     @classmethod
     def from_anthropic(cls, data: Dict[str, Any]) -> "UnifiedMessage":
@@ -376,6 +514,8 @@ class UnifiedMessage:
                 role=role,
                 content=[UnifiedContent(type=UnifiedContentType.TEXT, text=raw_content)],
                 cache_control=data.get("cache_control"),
+                name=data.get("name"),
+                raw_data=data,
             )
 
         # Handle list content
@@ -390,6 +530,8 @@ class UnifiedMessage:
             role=role,
             content=content_blocks,
             cache_control=data.get("cache_control"),
+            name=data.get("name"),
+            raw_data=data,
         )
 
     @classmethod
@@ -407,9 +549,11 @@ class UnifiedMessage:
                         type=UnifiedContentType.TOOL_RESULT,
                         tool_use_id_ref=data.get("tool_call_id"),
                         tool_result_content=data.get("content", ""),
+                        raw_data=data,
                     )
                 ],
                 name=data.get("name"),
+                raw_data=data,
             )
 
         content_blocks = []
@@ -428,7 +572,7 @@ class UnifiedMessage:
 
         # Handle reasoning_content
         if reasoning := data.get("reasoning_content"):
-            content_blocks.insert(0, UnifiedContent(type=UnifiedContentType.THINKING, text=reasoning))
+            content_blocks.insert(0, UnifiedContent(type=UnifiedContentType.THINKING, text=reasoning, raw_data={"reasoning_content": reasoning}))
 
         # Handle tool_calls
         if tool_calls := data.get("tool_calls"):
@@ -439,6 +583,8 @@ class UnifiedMessage:
             role=role,
             content=content_blocks,
             name=data.get("name"),
+            cache_control=data.get("cache_control"),
+            raw_data=data,
         )
 
 
@@ -550,6 +696,7 @@ class UnifiedChatRequest:
             }
 
         # Merge extra fields
+        result.update(self.openai_extra)
         result.update(self.anthropic_extra)
 
         return result
@@ -611,6 +758,7 @@ class UnifiedChatRequest:
                 result["max_completion_tokens"] = self.max_completion_tokens
 
         # Merge extra fields
+        result.update(self.anthropic_extra)
         result.update(self.openai_extra)
 
         return result
@@ -654,6 +802,8 @@ class UnifiedChatRequest:
                             tool_call_id=unified_content.tool_use_id_ref,
                             content=[unified_content],
                             cache_control=m.get("cache_control"),
+                            name=m.get("name"),
+                            raw_data=m,
                         )
                     )
             else:
@@ -679,6 +829,7 @@ class UnifiedChatRequest:
             tool_choice=data.get("tool_choice"),
             thinking_enabled=thinking_enabled,
             thinking_budget_tokens=thinking_budget_tokens,
+            anthropic_extra=_collect_extra_fields(data, _ANTHROPIC_REQUEST_STANDARD_KEYS),
         )
 
     @classmethod
@@ -706,6 +857,7 @@ class UnifiedChatRequest:
             tool_choice=data.get("tool_choice"),
             reasoning_effort=data.get("reasoning_effort"),
             max_completion_tokens=data.get("max_completion_tokens"),
+            openai_extra=_collect_extra_fields(data, _OPENAI_REQUEST_STANDARD_KEYS),
         )
 
 

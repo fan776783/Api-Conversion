@@ -57,6 +57,50 @@ def test_openai_responses_request_adapter_preserves_stream_and_maps_fields():
     assert adapted["messages"][1]["role"] == "user"
 
 
+def test_openai_responses_request_adapter_rehydrates_edit_tool_from_schema_snapshot():
+    payload = {
+        "model": "gpt-4.1",
+        "instructions": "继续修复",
+        "metadata": {"discovered_tools": ["Edit"]},
+        "x-tool-schemas": {
+            "Edit": {
+                "type": "function",
+                "function": {
+                    "name": "Edit",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                        },
+                        "required": ["old_string", "new_string"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        },
+        "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "patch it"}]},
+            {
+                "type": "function_call",
+                "call_id": "call_edit_2",
+                "name": "Edit",
+                "arguments": {"old_string": "before", "new_string": "after"},
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_edit_2",
+                "content": "ok",
+            },
+        ],
+    }
+
+    adapted = OpenAIResponsesRequestAdapter.adapt(payload)
+    assert adapted["tools"][0]["function"]["name"] == "Edit"
+    assert adapted["x-tool-schemas"]["Edit"]["function"]["parameters"]["required"] == ["old_string", "new_string"]
+    assert adapted["metadata"]["discovered_tools"] == ["Edit"]
+
+
 
 def test_chat_streaming_tool_arguments_are_only_emitted_on_content_block_stop():
     stream_id = "claude-3-5"

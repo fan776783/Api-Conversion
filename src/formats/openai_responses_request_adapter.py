@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 import copy
+from src.core.tool_policy import apply_openai_request_tool_policy
 
 
 _RESPONSES_REQUEST_KEYS = {
@@ -38,6 +39,8 @@ class OpenAIResponsesRequestAdapter:
         adapted = copy.deepcopy(payload)
         messages: List[Dict[str, Any]] = []
 
+        tool_schema_snapshot = adapted.get("x-tool-schemas") or adapted.get("x-discovered-tool-schemas")
+
         instructions = adapted.pop("instructions", None)
         if instructions not in (None, ""):
             messages.append({"role": "system", "content": instructions})
@@ -70,7 +73,10 @@ class OpenAIResponsesRequestAdapter:
         if "stream" in payload:
             adapted["stream"] = payload["stream"]
 
-        return adapted
+        if tool_schema_snapshot is not None:
+            adapted["x-tool-schemas"] = tool_schema_snapshot
+
+        return apply_openai_request_tool_policy(adapted)
 
     @classmethod
     def _convert_input_to_messages(cls, input_payload: Any) -> List[Dict[str, Any]]:
